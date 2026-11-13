@@ -1,0 +1,49 @@
+✗ RACE CONDITION DETECTED  [wallet-double-spend-withdraw]
+  Explored 6/20 schedules in 142ms (shrunk from 3 to a minimal 1-preemption trace)
+
+  Violated Invariants:
+    • no_negative_balance: Wallet balance must never drop below zero
+      Observed DB state: id=1, balance=-100
+    • at_most_one_successful_withdrawal: expected <= 1 HTTP 2xx, got 2 (req_a=200, req_b=200)
+
+  Deterministic Execution Timeline:
+  ┌──────┬────────────────────────────────┬────────────────────────────────┐
+  │ Step │ Worker req_a (PG pid 4812)     │ Worker req_b (PG pid 4813)     │
+  ├──────┼────────────────────────────────┼────────────────────────────────┤
+  │  t1  │ BEGIN                          │                                │
+  │  t2  │ SELECT balance FROM wallets    │                                │
+  │      │ WHERE id = $1 [$1=1]           │                                │
+  │      │ ──► returns 100                │                                │
+  │  ⚡  │─────────────────── context switch (preempt) ───────────────────►│
+  │  t3  │ ⏸ [paused before UPDATE]       │ BEGIN                          │
+  │  t4  │                                │ SELECT balance FROM wallets    │
+  │      │                                │ WHERE id = $1 [$1=1]           │
+  │      │                                │ ──► returns 100                │
+  │  t5  │ UPDATE wallets SET balance =   │                                │
+  │      │ balance - 100 WHERE id = 1     │                                │
+  │      │ ──► UPDATE 1                   │                                │
+  │  t6  │ COMMIT                         │                                │
+  │  t7  │ ✓ HTTP 200 OK                  │                                │
+  │  t8  │                                │ UPDATE wallets SET balance =   │
+  │      │                                │ balance - 100 WHERE id = 1     │
+  │      │                                │ ──► UPDATE 1                   │
+  │  t9  │                                │ COMMIT                         │
+  │ t10  │                                │ ✓ HTTP 200 OK                  │
+  └──────┴────────────────────────────────┴────────────────────────────────┘
+
+  Root Cause & Recommended Remediation (Fix Advisor):
+    Pattern: Unprotected Check-Then-Act under READ COMMITTED
+    Workers req_a and req_b each read `wallets` without a row lock and then
+    wrote it in a later statement.
+    Another transaction committed between the check and the write; READ
+    COMMITTED re-reads the row for the UPDATE but the application already made
+    its decision.
+    Fix Option A (Pessimistic Lock):
+      SELECT balance FROM wallets WHERE id = $1 FOR NO KEY UPDATE;
+      -- FOR NO KEY UPDATE blocks concurrent writers of the row but, unlike FOR UPDATE, not inserts of rows referencing it by foreign key.
+    Fix Option B (Atomic Guarded Update):
+      UPDATE wallets SET balance = balance - 100 WHERE id = 1 AND balance >= 100;
+      -- and verify rows_affected == 1 before reporting success.
+
+  Replay deterministically:
+    $ pgloom replay .pgloom-repro.json

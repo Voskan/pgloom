@@ -1,0 +1,34 @@
+# Two transfers in opposite directions, written as plain SQL workers: no
+# service is needed. PgLoom proves the lock-order deadlock deterministically
+# instead of waiting for PostgreSQL's deadlock_timeout to fire in production.
+#
+#   pgloom run examples/sql-transfer/pgloom.yaml
+version: 1
+name: "sql-transfer-deadlock"
+
+database:
+  upstream: "${PGLOOM_UPSTREAM_URL:-postgres://postgres:postgres@127.0.0.1:5432/postgres}"
+  setup_sql: |
+    CREATE TABLE IF NOT EXISTS accounts (id INT PRIMARY KEY, balance BIGINT NOT NULL);
+    TRUNCATE accounts;
+    INSERT INTO accounts (id, balance) VALUES (1, 100), (2, 100);
+
+workers:
+  - id: "a_to_b"
+    sql:
+      - "BEGIN"
+      - "UPDATE accounts SET balance = balance - 10 WHERE id = 1"
+      - "UPDATE accounts SET balance = balance + 10 WHERE id = 2"
+      - "COMMIT"
+  - id: "b_to_a"
+    sql:
+      - "BEGIN"
+      - "UPDATE accounts SET balance = balance - 10 WHERE id = 2"
+      - "UPDATE accounts SET balance = balance + 10 WHERE id = 1"
+      - "COMMIT"
+
+invariants:
+  sql:
+    - name: "money_is_conserved"
+      assert_true: "SELECT SUM(balance) = 200 FROM accounts"
+  fail_on_deadlock: true

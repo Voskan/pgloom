@@ -1,0 +1,32 @@
+[package]
+name = "pgloom-driver"
+description = "Scenario configuration (pgloom.yaml) and concurrent workload drivers for PgLoom"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+pgloom-engine.workspace = true
+pgloom-pgctrl.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde-saphyr.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pgloom-pgctrl = { workspace = true, features = ["testing"] }
+axum.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

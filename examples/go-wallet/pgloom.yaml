@@ -1,0 +1,55 @@
+# Double-spend check for the go-wallet example.
+#
+#   pgloom run                       # finds the race (exit 1)
+#   WALLET_FIX=lock pgloom run       # SELECT ... FOR NO KEY UPDATE (exit 0)
+#   WALLET_FIX=atomic pgloom run     # guarded UPDATE (exit 0)
+version: 1
+name: "go-wallet-withdraw"
+
+database:
+  upstream: "${PGLOOM_UPSTREAM_URL:-postgres://postgres:postgres@127.0.0.1:5432/postgres}"
+  proxy_listen: "127.0.0.1:15432"
+  setup_sql: |
+    CREATE TABLE IF NOT EXISTS wallets (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL);
+    TRUNCATE wallets;
+    INSERT INTO wallets (id, balance) VALUES (1, 100);
+
+target:
+  command: "go run ."
+  env:
+    # PgLoom also sets DATABASE_URL to its proxy when it is not given here.
+    DATABASE_URL: "postgres://postgres:postgres@127.0.0.1:15432/postgres?sslmode=disable"
+    LISTEN_ADDR: "127.0.0.1:18080"
+    WALLET_FIX: "${WALLET_FIX:-}"
+  ready_http: "http://127.0.0.1:18080/healthz"
+  # The first `go run` compiles the service.
+  startup_timeout_ms: 60000
+
+exploration:
+  strategy: "bounded"
+  max_preemptions: 2
+  max_schedules: 50
+
+workers:
+  - id: "req_a"
+    http:
+      method: "POST"
+      url: "http://127.0.0.1:18080/withdraw"
+      headers: { Content-Type: "application/json" }
+      body: '{"wallet_id": 1, "amount": 100}'
+  - id: "req_b"
+    http:
+      method: "POST"
+      url: "http://127.0.0.1:18080/withdraw"
+      headers: { Content-Type: "application/json" }
+      body: '{"wallet_id": 1, "amount": 100}'
+
+invariants:
+  sql:
+    - name: "no_negative_balance"
+      description: "Wallet balance must never drop below zero"
+      assert_true: "SELECT COALESCE(MIN(balance), 0) >= 0 FROM wallets"
+      diagnostic_query: "SELECT id, balance FROM wallets"
+  responses:
+    - name: "at_most_one_successful_withdrawal"
+      max_2xx_count: 1

@@ -1,0 +1,31 @@
+[package]
+name = "pgloom-wire"
+description = "PostgreSQL v3 wire-protocol codec and turn-gating L7 proxy used by PgLoom"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# Exposes an in-process mock PostgreSQL server and a raw wire client for
+# integration tests of downstream crates. Not part of the stable API.
+testkit = []
+
+[dependencies]
+bytes.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+pgloom-wire = { path = ".", features = ["testkit"] }
+
+[lints]
+workspace = true

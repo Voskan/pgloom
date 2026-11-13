@@ -1,0 +1,119 @@
+use std::time::Instant;
+
+use pgloom_driver::{Config, ReductionName, StrategyName};
+use pgloom_engine::{RunOutcome, RunReport};
+use pgloom_report::{AUDIT_FOOTER, ReportContext, ReproFile, render_json, render_run};
+
+use crate::cli::{Format, RunArgs};
+use crate::error::{CliError, EXIT_PASS, EXIT_VIOLATION};
+use crate::output::Printer;
+use crate::session::{Overrides, RunOptions, Session};
+
+pub(crate) fn overrides(args: &RunArgs) -> Overrides {
+    Overrides {
+        upstream: args.connection.upstream.clone(),
+        listen: args.connection.listen.clone(),
+        strategy: args.strategy.map(Into::into),
+        max_preemptions: args.max_preemptions,
+        max_schedules: args.max_schedules,
+        seed: args.seed,
+        reduction: args.reduction.map(Into::into),
+    }
+}
+
+/// Describes the exploration settings in one line.
+pub fn plan_line(config: &Config) -> String {
+    let e = &config.exploration;
+    let strategy = match e.strategy {
+        StrategyName::Exhaustive => match e.effective_reduction() {
+            ReductionName::Dpor => "exhaustive (dpor)".to_owned(),
+            ReductionName::None => "exhaustive".to_owned(),
+        },
+        StrategyName::Bounded => format!("bounded (≤{} preemptions)", e.max_preemptions),
+        StrategyName::Random => format!("random (seed {})", e.seed.unwrap_or(0x5EED)),
+    };
+    format!(
+        "{} workers · strategy {strategy} · max {} schedules",
+        config.workers.len(),
+        e.max_schedules
+    )
+}
+
+pub fn report_context(config: &Config, workers: &[String], printer: &Printer) -> ReportContext {
+    let mut ctx = ReportContext::new(config.name.clone(), workers.to_vec());
+    ctx.color = printer.color;
+    ctx.footer = (!printer.quiet).then(|| AUDIT_FOOTER.to_owned());
+    ctx.max_schedules = config.exploration.max_schedules;
+    ctx.strategy = match config.exploration.strategy {
+        StrategyName::Exhaustive => "exhaustive",
+        StrategyName::Bounded => "bounded",
+        StrategyName::Random => "random",
+    }
+    .to_owned();
+    ctx.descriptions = config
+        .invariants
+        .sql
+        .iter()
+        .filter_map(|i| i.description.clone().map(|d| (i.name.clone(), d)))
+        .collect();
+    ctx
+}
+
+pub async fn run(args: RunArgs, printer: Printer) -> Result<u8, CliError> {
+    let loaded = Config::load(&args.config)?;
+    let mut config = loaded.config;
+    overrides(&args).apply(&mut config)?;
+    let pretty = args.format == Format::Pretty;
+    if pretty {
+        printer.progress(&format!(
+            "▶ pgloom run [{}]: {}",
+            config.name,
+            plan_line(&config)
+        ));
+    }
+    let options = RunOptions {
+        stop_on_first_failure: !args.find_all,
+        shrink: !args.no_shrink,
+    };
+    let started = Instant::now();
+    let session = Session::start(config, options).await?;
+    if pretty {
+        printer.progress(&format!(
+            "  proxy {} → {} (setup {}ms)",
+            session
+                .proxy_addr()
+                .map_or_else(String::new, |a| a.to_string()),
+            session.upstream(),
+            started.elapsed().as_millis()
+        ));
+    }
+    let result = session.run().await;
+    let config = session.config().clone();
+    let workers = session.workers().to_vec();
+    session.close().await;
+    let report: RunReport = result?;
+
+    let mut ctx = report_context(&config, &workers, &printer);
+    if let Some(first) = report.failures.first() {
+        let repro = ReproFile::from_failure(
+            &config.name,
+            &args.config.display().to_string(),
+            &loaded.source,
+            &workers,
+            first,
+        );
+        match repro.save(&args.repro_out) {
+            Ok(()) => ctx.repro_path = Some(args.repro_out.display().to_string()),
+            Err(e) => printer.warn(&e.to_string()),
+        }
+    }
+    let text = match args.format {
+        Format::Pretty => render_run(&ctx, &report),
+        Format::Json => render_json(&ctx, &report),
+    };
+    printer.report(&text);
+    Ok(match report.outcome {
+        RunOutcome::Pass => EXIT_PASS,
+        RunOutcome::ViolationFound => EXIT_VIOLATION,
+    })
+}

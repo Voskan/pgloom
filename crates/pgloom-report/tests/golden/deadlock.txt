@@ -1,0 +1,41 @@
+✗ DEADLOCK DETECTED  [transfer-deadlock]
+  Explored 6/20 schedules in 142ms (1-preemption trace)
+
+  Violated Invariants:
+    • deadlock: req_a → req_b → req_a (found in the wait-for graph before PostgreSQL's deadlock_timeout)
+      req_a waits in: UPDATE accounts SET balance = balance + 10 WHERE id = 2
+      req_b waits in: UPDATE accounts SET balance = balance + 10 WHERE id = 1
+
+  Deterministic Execution Timeline:
+  ┌──────┬────────────────────────────────┬────────────────────────────────┐
+  │ Step │ Worker req_a (PG pid 4812)     │ Worker req_b (PG pid 4813)     │
+  ├──────┼────────────────────────────────┼────────────────────────────────┤
+  │  t1  │ BEGIN                          │                                │
+  │  t2  │ UPDATE accounts SET balance =  │                                │
+  │      │ balance - 10 WHERE id = 1      │                                │
+  │      │ ──► UPDATE 1                   │                                │
+  │  ⚡  │─────────────────── context switch (preempt) ───────────────────►│
+  │  t3  │ ⏸ [paused before UPDATE]       │ BEGIN                          │
+  │  t4  │                                │ UPDATE accounts SET balance =  │
+  │      │                                │ balance - 10 WHERE id = 2      │
+  │      │                                │ ──► UPDATE 1                   │
+  │  t5  │                                │ 🔒 UPDATE accounts SET balance │
+  │      │                                │ = balance + 10 WHERE id = 1    │
+  │      │                                │ (blocked by req_a)             │
+  │  t6  │ 🔒 UPDATE accounts SET balance │                                │
+  │      │ = balance + 10 WHERE id = 2    │                                │
+  │      │ (blocked by req_b)             │                                │
+  └──────┴────────────────────────────────┴────────────────────────────────┘
+
+  Root Cause & Recommended Remediation (Fix Advisor):
+    Pattern: Lock-Order Inversion (deadlock)
+    Workers acquire the same row locks in opposite orders: req_a → req_b →
+    req_a.
+    req_a waits in: UPDATE accounts SET balance = balance + 10 WHERE id = 2
+    req_b waits in: UPDATE accounts SET balance = balance + 10 WHERE id = 1
+    Fix: lock rows in one canonical order at the start of the transaction:
+      SELECT id FROM <table> WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE;
+      -- e.g. always lock the lower id first in transfers between two accounts.
+
+  Replay deterministically:
+    $ pgloom replay .pgloom-repro.json

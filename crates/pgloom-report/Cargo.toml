@@ -1,0 +1,30 @@
+[package]
+name = "pgloom-report"
+description = "Execution timelines, Fix Advisor and replay files for PgLoom"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+pgloom-engine.workspace = true
+pgloom-wire.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+pgloom-wire.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+unicode-width.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,63 @@
+# Lost-update check for the python-wallet example.
+#
+#   pgloom run                       # finds the race (exit 1)
+#   WALLET_FIX=lock pgloom run       # SELECT ... FOR NO KEY UPDATE (exit 0)
+#   WALLET_FIX=atomic pgloom run     # guarded UPDATE (exit 0)
+#
+# Run it from a virtualenv with requirements.txt installed.
+version: 1
+name: "python-wallet-withdraw"
+
+database:
+  upstream: "${PGLOOM_UPSTREAM_URL:-postgres://postgres:postgres@127.0.0.1:5432/postgres}"
+  proxy_listen: "127.0.0.1:15433"
+  # The service creates its table on startup, so the data is seeded once it
+  # is ready (and before PgLoom snapshots the database).
+  setup_sql: "DROP TABLE IF EXISTS wallets"
+  seed_sql: "INSERT INTO wallets (id, balance) VALUES (1, 100)"
+
+target:
+  command: "python app.py"
+  env:
+    DATABASE_URL: "postgres://postgres:postgres@127.0.0.1:15433/postgres?sslmode=disable"
+    LISTEN_ADDR: "127.0.0.1:18081"
+    WALLET_FIX: "${WALLET_FIX:-}"
+  ready_http: "http://127.0.0.1:18081/healthz"
+
+exploration:
+  # Two requests of a few statements each: every interleaving fits in a
+  # handful of schedules, and DPOR runs each equivalent order once.
+  strategy: "exhaustive"
+  reduction: "dpor"
+  max_schedules: 100
+
+workers:
+  - id: "req_a"
+    http:
+      method: "POST"
+      url: "http://127.0.0.1:18081/withdraw"
+      headers: { Content-Type: "application/json" }
+      body: '{"wallet_id": 1, "amount": 60}'
+  - id: "req_b"
+    http:
+      method: "POST"
+      url: "http://127.0.0.1:18081/withdraw"
+      headers: { Content-Type: "application/json" }
+      body: '{"wallet_id": 1, "amount": 60}'
+
+invariants:
+  sql:
+    - name: "no_negative_balance"
+      description: "Wallet balance must never drop below zero"
+      assert_true: "SELECT COALESCE(MIN(balance), 0) >= 0 FROM wallets"
+      diagnostic_query: "SELECT id, balance FROM wallets"
+  responses:
+    - name: "at_most_one_successful_withdrawal"
+      description: "$100 covers only one $60 withdrawal"
+      max_2xx_count: 1
+    - name: "withdrawals_report_distinct_balances"
+      description: "Two debits of one wallet cannot both leave the same balance"
+      json:
+        - { pointer: "/status", equals: "withdrawn" }
+        - { pointer: "/balance", min: 0 }
+      distinct: "/balance"

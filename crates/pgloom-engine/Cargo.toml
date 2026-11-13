@@ -1,0 +1,27 @@
+[package]
+name = "pgloom-engine"
+description = "Deterministic schedule exploration, lock parking and episode coordination for PgLoom"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+pgloom-wire.workspace = true
+pgloom-pgctrl.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pgloom-wire = { workspace = true, features = ["testkit"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "pgloom-pgctrl"
+description = "Control-connection utilities for PgLoom: lock inspection, snapshot/restore and SQL invariants"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# Disposable per-test databases for integration tests of downstream crates.
+testing = []
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pgloom-pgctrl = { path = ".", features = ["testing"] }
+
+[lints]
+workspace = true

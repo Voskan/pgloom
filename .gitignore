@@ -1,0 +1,35 @@
+# Build artifacts
+/target/
+/dist/
+/bin/
+*.profraw
+*.profdata
+coverage/
+lcov.info
+
+# OS and editor files
+.DS_Store
+.AppleDouble
+.LSOverride
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local environment and runtime data
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+*.db
+/tmp/
+/.pgloom-cache/
+/.pgloom-traces/
+.venv/
+__pycache__/
+*.pyc
+
+# Replay files written by `pgloom run`
+.pgloom-repro.json
