@@ -222,6 +222,10 @@ impl SchemaModel {
                     }
                 }
             }
+            // Row-level security is deliberately not checked here: foreign-key
+            // cascades and checks always bypass row security, so they run no
+            // policy. Only statements on the table itself do (see
+            // `policy_reads`).
             let mut out = BTreeSet::new();
             for oid in seen.iter().chain(extra.iter()) {
                 let rel = by_oid.get(oid)?;

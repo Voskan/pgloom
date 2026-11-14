@@ -3,12 +3,19 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Rebuilds and re-uploads the assets of an existing tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v0.1.0"
+        required: true
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -28,13 +35,15 @@ jobs:
             os: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.TAG }}
       - name: The tag matches the crate version
         shell: bash
         run: |
           version=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "pgloom") | .version')
-          test "v$version" = "$GITHUB_REF_NAME" || {
-            echo "tag $GITHUB_REF_NAME does not match version $version" >&2
+          test "v$version" = "$TAG" || {
+            echo "tag $TAG does not match version $version" >&2
             exit 1
           }
       - uses: dtolnay/rust-toolchain@stable
@@ -48,14 +57,17 @@ jobs:
           key: ${{ matrix.target }}
       - name: Build
         run: cargo build --release --locked -p pgloom --target ${{ matrix.target }}
+      # Each archive is published twice: under a versioned name, and under a
+      # stable one that releases/latest/download/ always resolves.
       - name: Package
         shell: bash
         run: |
-          name="pgloom-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir "$name"
-          cp "target/${{ matrix.target }}/release/pgloom" README.md LICENSE "$name/"
-          tar -czf "$name.tar.gz" "$name"
-          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          dir="pgloom-${{ matrix.target }}"
+          mkdir "$dir"
+          cp "target/${{ matrix.target }}/release/pgloom" README.md LICENSE "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+          cp "$dir.tar.gz" "pgloom-${TAG}-${{ matrix.target }}.tar.gz"
+          for f in pgloom-*.tar.gz; do shasum -a 256 "$f" > "$f.sha256"; done
       - name: Smoke test
         if: matrix.target != 'x86_64-apple-darwin'
         run: target/${{ matrix.target }}/release/pgloom --version
@@ -75,13 +87,18 @@ jobs:
         with:
           pattern: pgloom-*
           merge-multiple: true
+      # Idempotent: a release created by hand, or a re-run, gets its assets
+      # replaced instead of failing on an existing release.
       - name: Publish the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cat pgloom-*.sha256 > SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            pgloom-*.tar.gz SHA256SUMS
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+              pgloom-*.tar.gz SHA256SUMS
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "$TAG" --generate-notes \
+              pgloom-*.tar.gz SHA256SUMS
+          fi

@@ -100,10 +100,11 @@ $ curl -sSfL https://github.com/Voskan/pgloom/releases/latest/download/pgloom-v0
 $ ./pgloom-v0.1.0-x86_64-unknown-linux-musl/pgloom demo
 ```
 
-Or build from source with Rust 1.89 or newer:
+Or install from [crates.io](https://crates.io/crates/pgloom) with Rust 1.89
+or newer:
 
 ```console
-$ cargo install --git https://github.com/Voskan/pgloom pgloom
+$ cargo install pgloom --locked
 ```
 
 PostgreSQL 12 or newer is required. The role PgLoom connects as needs
@@ -184,10 +185,10 @@ they can check JSON response bodies:
 | `apply_to: success\|all` | Body checks look at 2xx responses (default) or every response. |
 | `workers: [ids]` | Restrict body checks to these HTTP workers. |
 
-See [`examples/go-wallet`](examples/go-wallet) for a Go service using a
-`pgx` connection pool, [`examples/python-wallet`](examples/python-wallet)
+See [`examples/go-wallet`](https://github.com/Voskan/pgloom/tree/main/examples/go-wallet) for a Go service using a
+`pgx` connection pool, [`examples/python-wallet`](https://github.com/Voskan/pgloom/tree/main/examples/python-wallet)
 for a Python lost update caught only by its responses, and
-[`examples/sql-transfer`](examples/sql-transfer) for a deadlock found
+[`examples/sql-transfer`](https://github.com/Voskan/pgloom/tree/main/examples/sql-transfer) for a deadlock found
 without any service at all.
 
 ## How it works
@@ -317,4 +318,4 @@ second pair of eyes on its concurrency design, write to
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](https://github.com/Voskan/pgloom/blob/main/LICENSE).

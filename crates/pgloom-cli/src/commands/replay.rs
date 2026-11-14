@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use pgloom_driver::Config;
@@ -14,12 +14,13 @@ pub async fn replay(args: ReplayArgs, printer: Printer) -> Result<u8, CliError> 
     let repro = ReproFile::load(&args.repro)?;
     // The embedded scenario is authoritative: the schedule refers to its workers.
     let mut config = Config::parse(&repro.config_source, &repro.config_path)?;
-    config.resolve_paths(
-        Path::new(&repro.config_path)
-            .parent()
-            .unwrap_or(Path::new("")),
-    );
-    if let Ok(current) = std::fs::read_to_string(Path::new(&repro.config_path))
+    let scenario = locate_scenario(&repro.config_path, &args.repro);
+    config.resolve_paths(match &scenario {
+        Some(path) => path.parent().unwrap_or(Path::new("")),
+        None => args.repro.parent().unwrap_or(Path::new("")),
+    });
+    if let Some(path) = &scenario
+        && let Ok(current) = std::fs::read_to_string(path)
         && !repro.matches_config(&current)
     {
         printer.warn(&format!(
@@ -88,5 +89,44 @@ pub async fn replay(args: ReplayArgs, printer: Printer) -> Result<u8, CliError> 
         text.push_str(&render_episode(&ctx, &episode.record, &episode.violations));
         printer.report(&text);
         Ok(EXIT_VIOLATION)
+    }
+}
+
+/// The scenario file a repro was recorded from. Its path is relative to the
+/// directory `pgloom run` ran in, which need not be the current one: it is
+/// looked up as recorded, then next to the repro file (`run` writes the repro
+/// to its own current directory by default).
+fn locate_scenario(recorded: &str, repro: &Path) -> Option<PathBuf> {
+    let recorded = Path::new(recorded);
+    let beside_repro = repro.parent().map(|dir| dir.join(recorded));
+    std::iter::once(recorded.to_owned())
+        .chain(beside_repro)
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scenario_is_found_from_any_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let example = root.path().join("examples/wallet");
+        std::fs::create_dir_all(&example).unwrap();
+        std::fs::write(example.join("pgloom.yaml"), "").unwrap();
+        let repro = example.join(".pgloom-repro.json");
+
+        // Recorded inside the example directory, replayed from elsewhere.
+        assert_eq!(
+            locate_scenario("pgloom.yaml", &repro),
+            Some(example.join("pgloom.yaml"))
+        );
+        // Recorded with a path that still resolves as written.
+        let absolute = example.join("pgloom.yaml");
+        assert_eq!(
+            locate_scenario(absolute.to_str().unwrap(), Path::new(".pgloom-repro.json")),
+            Some(absolute)
+        );
+        assert_eq!(locate_scenario("missing.yaml", &repro), None);
     }
 }
