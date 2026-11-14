@@ -248,11 +248,11 @@ fn lock_order(
     }
 }
 
-/// Finds the first top-level (outside parentheses and single-quoted literals)
-/// ASCII case-insensitive occurrence of `needle`.
-fn find_top_level(s: &str, needle: &str) -> Option<usize> {
+/// Byte offsets of `s` that lie outside parentheses and single-quoted
+/// literals. Parentheses and quotes themselves are never reported.
+fn top_level_offsets(s: &str) -> Vec<usize> {
     let bytes = s.as_bytes();
-    let nlen = needle.len();
+    let mut out = Vec::new();
     let mut depth = 0usize;
     let mut in_str = false;
     let mut i = 0;
@@ -273,19 +273,34 @@ fn find_top_level(s: &str, needle: &str) -> Option<usize> {
             b'\'' => in_str = true,
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
-            _ if depth == 0
-                && i + nlen <= bytes.len()
-                && s.is_char_boundary(i)
-                && s.is_char_boundary(i + nlen)
-                && s[i..i + nlen].eq_ignore_ascii_case(needle) =>
-            {
-                return Some(i);
-            }
+            _ if depth == 0 => out.push(i),
             _ => {}
         }
         i += 1;
     }
-    None
+    out
+}
+
+/// Finds the first top-level ASCII case-insensitive occurrence of `needle`.
+fn find_top_level(s: &str, needle: &str) -> Option<usize> {
+    top_level_offsets(s).into_iter().find(|&i| {
+        s.get(i..i + needle.len())
+            .is_some_and(|w| w.eq_ignore_ascii_case(needle))
+    })
+}
+
+/// Splits `s` on commas that are not nested in parentheses or literals.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut from = 0;
+    for i in top_level_offsets(s) {
+        if s.as_bytes()[i] == b',' {
+            parts.push(&s[from..i]);
+            from = i + 1;
+        }
+    }
+    parts.push(&s[from..]);
+    parts
 }
 
 /// Splits off a trailing top-level `RETURNING ...` clause so `WHERE` / `ON
@@ -362,17 +377,22 @@ fn append_where_guard(sql: &str, guard: &str) -> String {
     match split_update(sql) {
         Some(u) => u.render_with_guard(guard),
         None => {
-            let (body, ret) = split_returning(sql.trim_end_matches(';'));
-            match ret {
-                Some(r) => format!("{body} AND {guard} {r};"),
-                None => format!("{body} AND {guard};"),
-            }
+            let flat = one_line(sql);
+            let (body, ret) = split_returning(flat.trim_end_matches(';'));
+            let joiner = if find_top_level(body, " WHERE ").is_some() {
+                "AND"
+            } else {
+                "WHERE"
+            };
+            let ret = ret.map_or_else(String::new, |r| format!(" {r}"));
+            format!("{body} {joiner} {guard}{ret};")
         }
     }
 }
 
 fn assignments(set: &str) -> Vec<(String, String)> {
-    set.split(',')
+    split_top_level_commas(set)
+        .into_iter()
         .filter_map(|a| a.split_once('='))
         .map(|(c, e)| (c.trim().to_owned(), e.trim().to_owned()))
         .collect()
@@ -550,6 +570,33 @@ mod tests {
         assert_eq!(
             a.fixes[0].sql[1],
             "INSERT INTO bookings (slot) VALUES (7) ON CONFLICT DO NOTHING RETURNING id;"
+        );
+    }
+
+    #[test]
+    fn set_clauses_split_only_on_top_level_commas() {
+        assert_eq!(
+            assignments("balance = GREATEST(balance - $1, 0), note = 'a, b', v = v + 1"),
+            [
+                ("balance".to_owned(), "GREATEST(balance - $1, 0)".to_owned()),
+                ("note".to_owned(), "'a, b'".to_owned()),
+                ("v".to_owned(), "v + 1".to_owned()),
+            ]
+        );
+        assert!(!is_absolute_assignment(
+            "UPDATE t SET a = $1, b = coalesce(b, 0) + 1 WHERE id = $2"
+        ));
+    }
+
+    #[test]
+    fn guards_without_a_where_clause_start_one() {
+        assert_eq!(
+            append_where_guard("DELETE FROM holds\nRETURNING id;", "expires_at < now()"),
+            "DELETE FROM holds WHERE expires_at < now() RETURNING id;"
+        );
+        assert_eq!(
+            append_where_guard("DELETE FROM holds WHERE id = $1", "expires_at < now()"),
+            "DELETE FROM holds WHERE id = $1 AND expires_at < now();"
         );
     }
 }

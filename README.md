@@ -300,6 +300,13 @@ Global flags: `--color auto|always|never`, `--quiet`, `-v`/`-vv`.
   use `sslmode=disable`). Unix-domain sockets are not supported.
 * Nondeterminism in the service itself (randomized retries, timers, background
   jobs touching the same tables) is reported rather than explored.
+* A turn is indivisible: an extended-protocol pipeline up to `Sync`, or a
+  simple query holding several statements, runs as one step. Interleavings
+  between turns are explored, interleavings inside a single batch are not.
+  Check-then-act races are unaffected, since the application cannot branch in
+  the middle of a batch it has already sent.
+* Linux and macOS only. The target service and `exec` workers are launched
+  through `sh`; Windows is not supported.
 
 ## Project layout
 

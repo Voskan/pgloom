@@ -70,7 +70,7 @@ impl PgControl {
             .query_one("SELECT pg_backend_pid()", &[])
             .await
             .map_err(PgCtrlError::query("reading control backend pid"))?
-            .get(0);
+            .col(0, "reading control backend pid")?;
         let blocking_stmt = client
             .prepare(
                 "SELECT pid, wait_event_type, pg_blocking_pids(pid) \
