@@ -42,8 +42,12 @@ pub mod backend_tag {
     pub const COPY_IN_RESPONSE: u8 = b'G';
     pub const COPY_OUT_RESPONSE: u8 = b'H';
     pub const COPY_BOTH_RESPONSE: u8 = b'W';
+    pub const COPY_DATA: u8 = b'd';
+    pub const COPY_DONE: u8 = b'c';
     pub const PARSE_COMPLETE: u8 = b'1';
     pub const BIND_COMPLETE: u8 = b'2';
+    pub const PORTAL_SUSPENDED: u8 = b's';
+    pub const PARAMETER_DESCRIPTION: u8 = b't';
     pub const NO_DATA: u8 = b'n';
 }
 
@@ -633,7 +637,31 @@ pub mod build {
     }
 
     pub fn no_data() -> Frame {
-        Frame::new(b'n', Bytes::new())
+        Frame::new(backend_tag::NO_DATA, Bytes::new())
+    }
+
+    pub fn flush() -> Frame {
+        Frame::new(tag::FLUSH, Bytes::new())
+    }
+
+    pub fn copy_in_response(columns: usize) -> Frame {
+        let mut b = BytesMut::with_capacity(3 + 2 * columns);
+        b.put_u8(0);
+        b.put_i16(columns as i16);
+        for _ in 0..columns {
+            b.put_i16(0);
+        }
+        Frame::new(backend_tag::COPY_IN_RESPONSE, b.freeze())
+    }
+
+    pub fn copy_out_response(columns: usize) -> Frame {
+        let mut b = BytesMut::with_capacity(3 + 2 * columns);
+        b.put_u8(0);
+        b.put_i16(columns as i16);
+        for _ in 0..columns {
+            b.put_i16(0);
+        }
+        Frame::new(backend_tag::COPY_OUT_RESPONSE, b.freeze())
     }
 }
 

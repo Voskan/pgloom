@@ -6,6 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Pipelined `Parse` + `Describe` batches (multiple `Describe(Statement)` and
+  `Describe(Portal)` messages in a single `Flush` or `Sync` pipeline) preserve
+  each object's column layout in wire order instead of overwriting earlier
+  schemas on `NoData`, and invalidate cached layouts on `Parse`, `Bind`,
+  `Close` and transaction end.
+- Supervised `COPY` streams safely across `CopyInResponse` (`'G'`) and
+  `CopyOutResponse` (`'H'`) in both Simple Query and Extended Query protocols
+  (`Execute` + `Flush` and `Execute` + `Sync` with post-`CopyDone` `Sync`),
+  and keeps eagerly pipelined `CopyData` ordered behind a gated `COPY` turn.
+- Fix Advisor handles multibyte UTF-8 at keyword boundaries, SQL comments
+  (`/* ... */` and `-- ...`), double-quoted identifiers, `E'...'` escape
+  strings, dollar-quoted literals and deeply nested `CAST(...)` expressions
+  without panicking or commenting out proposed SQL.
+
+### Added
+
+- Property-based test suites (`proptest`) and `cargo-fuzz` targets (`fuzz/`)
+  for wire frame/startup/message decoding, `classify_sql` and
+  `pgloom_report::advisor::advise`.
+
+### Changed
+
+- Update `github.com/jackc/pgx/v5` to 5.12.0 in `examples/go-wallet`.
+
 ## [0.1.1] - 2026-11-14
 
 ### Security

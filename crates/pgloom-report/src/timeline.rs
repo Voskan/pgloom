@@ -322,8 +322,42 @@ fn shown_result(step: &RecordedStep) -> Option<String> {
     Some(r.to_owned())
 }
 
+pub(crate) fn strip_leading_comments(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("--") {
+            match rest.find('\n') {
+                Some(nl) => s = &rest[nl + 1..],
+                None => return "",
+            }
+        } else if s.starts_with("/*") {
+            let bytes = s.as_bytes();
+            let mut depth = 0usize;
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += s[i..].chars().next().map_or(1, char::len_utf8);
+                }
+            }
+            s = &s[i..];
+        } else {
+            return s;
+        }
+    }
+}
+
 pub(crate) fn first_keyword(sql: &str) -> String {
-    sql.split(|c: char| c.is_whitespace() || c == ';' || c == '(')
+    strip_leading_comments(sql)
+        .split(|c: char| c.is_whitespace() || c == ';' || c == '(')
         .find(|s| !s.is_empty())
         .unwrap_or("")
         .to_ascii_uppercase()

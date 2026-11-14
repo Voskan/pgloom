@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.1"
@@ -37,6 +38,7 @@ unicode-width = "0.2"
 
 assert_cmd = "2.2"
 predicates = "3.1"
+proptest = { version = "1.6", default-features = false, features = ["std"] }
 tempfile = "3.27"
 
 [workspace.lints.rust]

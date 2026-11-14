@@ -28,11 +28,12 @@ use crate::error::{Peer, WireError, WireResult};
 use crate::frame::{CANCEL_REQUEST_CODE, StartupPacket};
 use crate::io::FrameReader;
 use crate::messages::{
-    BackendKeyData, BackendPid, ColumnDesc, FormatCode, TxStatus, backend_tag, broadcast,
-    decode_ready_for_query,
+    BackendKeyData, BackendPid, ColumnDesc, TxStatus, backend_tag, decode_ready_for_query,
 };
-use crate::response::{ResponseCollector, TurnResponse};
-use crate::turn::{BoundStatement, ClientUnit, ResultShape, Terminator, TurnAssembler, WireTurn};
+use crate::response::{PortalLayout, ResponseCollector, TurnResponse};
+use crate::turn::{
+    BoundStatement, ClientUnit, DescribeTarget, ResultShape, Terminator, TurnAssembler, WireTurn,
+};
 
 /// Identifier of a proxied client connection, unique per proxy instance.
 pub type ConnId = u64;
@@ -248,11 +249,17 @@ impl Shared {
 struct Expectation {
     seq: u64,
     gated: Option<EventTx>,
-    described_statement: Option<String>,
-    result_shape: Option<ResultShape>,
-    /// A `Describe`-then-`Flush` round trip: complete once the statement's
-    /// row layout (or an error) arrives, since no `ReadyForQuery` follows.
+    describes: VecDeque<DescribeTarget>,
+    result_shapes: VecDeque<ResultShape>,
+    reset_statements: Vec<String>,
+    reset_portals: Vec<String>,
+    /// A `Describe`-then-`Flush` round trip: complete once every queued
+    /// object's row layout (or an error) arrives, since no `ReadyForQuery`
+    /// follows.
     describe_only: bool,
+    /// An `Execute("COPY ...")`-then-`Flush` round trip: stream errors as well
+    /// as `CopyInResponse` / `CopyOutResponse` so the client sends `Sync`.
+    is_copy_flush: bool,
 }
 
 async fn run_session(
@@ -395,61 +402,89 @@ async fn relay_client(
     mut ctx: ClientCtx<'_>,
 ) -> WireResult<()> {
     let mut assembler = TurnAssembler::new();
-    let mut queue: VecDeque<WireTurn> = VecDeque::new();
+    let mut queue: VecDeque<ClientUnit> = VecDeque::new();
     let mut held: Option<Held> = None;
     let mut awaiting_response = false;
+    let mut pending_resets = PendingResets::default();
     let mut seq: u64 = 0;
 
     loop {
-        while held.is_none() && !awaiting_response {
-            let Some(turn) = queue.pop_front() else { break };
-            seq += 1;
-            let status = ctx.shared.tx_status();
-            let events = ctx.gate.sender().filter(|_| should_gate(&turn, status));
-            match events {
-                Some(events) => {
-                    let (permit_tx, permit_rx) = oneshot::channel();
-                    let info = TurnInfo {
-                        conn: ctx.conn,
-                        seq,
-                        backend_pid: ctx.backend_pid,
-                        tx_status: status,
-                        statements: turn.statements.clone(),
-                        meta: turn.meta.clone(),
+        while held.is_none() {
+            match queue.front() {
+                Some(ClientUnit::CopyFrame(_)) => {
+                    let Some(ClientUnit::CopyFrame(frame)) = queue.pop_front() else {
+                        unreachable!();
                     };
-                    trace!(conn = ctx.conn, seq, sql = %info.sql_text(), "turn held at gate");
-                    let pending = PendingTurn {
-                        info,
-                        permit: Permit(permit_tx),
+                    swr.write_all(&frame.to_bytes()).await?;
+                }
+                Some(ClientUnit::Turn(_)) if !awaiting_response => {
+                    let Some(ClientUnit::Turn(turn)) = queue.pop_front() else {
+                        unreachable!();
                     };
-                    if events.send(GateEvent::TurnReady(pending)).is_ok() {
-                        held = Some(Held {
-                            turn,
-                            seq,
-                            events,
-                            permit: permit_rx,
-                        });
-                    } else {
-                        forward(&mut swr, &ctx.expect_tx, turn, seq, None).await?;
+                    seq += 1;
+                    let status = ctx.shared.tx_status();
+                    let events = ctx.gate.sender().filter(|_| should_gate(&turn, status));
+                    match events {
+                        Some(events) => {
+                            let (permit_tx, permit_rx) = oneshot::channel();
+                            let info = TurnInfo {
+                                conn: ctx.conn,
+                                seq,
+                                backend_pid: ctx.backend_pid,
+                                tx_status: status,
+                                statements: turn.statements.clone(),
+                                meta: turn.meta.clone(),
+                            };
+                            trace!(conn = ctx.conn, seq, sql = %info.sql_text(), "turn held at gate");
+                            let pending = PendingTurn {
+                                info,
+                                permit: Permit(permit_tx),
+                            };
+                            if events.send(GateEvent::TurnReady(pending)).is_ok() {
+                                held = Some(Held {
+                                    turn,
+                                    seq,
+                                    events,
+                                    permit: permit_rx,
+                                });
+                            } else {
+                                forward(
+                                    &mut swr,
+                                    &ctx.expect_tx,
+                                    &mut pending_resets,
+                                    turn,
+                                    seq,
+                                    None,
+                                )
+                                .await?;
+                            }
+                        }
+                        None => {
+                            let terminate = turn.terminator == Terminator::Terminate;
+                            forward(
+                                &mut swr,
+                                &ctx.expect_tx,
+                                &mut pending_resets,
+                                turn,
+                                seq,
+                                None,
+                            )
+                            .await?;
+                            if terminate {
+                                return Ok(());
+                            }
+                        }
                     }
                 }
-                None => {
-                    let terminate = turn.terminator == Terminator::Terminate;
-                    forward(&mut swr, &ctx.expect_tx, turn, seq, None).await?;
-                    if terminate {
-                        return Ok(());
-                    }
-                }
+                _ => break,
             }
         }
 
         tokio::select! {
             frame = creader.next() => {
                 let Some(frame) = frame? else { return Ok(()) };
-                match assembler.push(frame)? {
-                    Some(ClientUnit::Turn(turn)) => queue.push_back(turn),
-                    Some(ClientUnit::CopyFrame(frame)) => swr.write_all(&frame.to_bytes()).await?,
-                    None => {}
+                if let Some(unit) = assembler.push(frame)? {
+                    queue.push_back(unit);
                 }
             }
             granted = async {
@@ -463,7 +498,15 @@ async fn relay_client(
                 // forward the turn unsupervised.
                 let events = granted.ok().map(|()| h.events);
                 awaiting_response = events.is_some();
-                forward(&mut swr, &ctx.expect_tx, h.turn, h.seq, events).await?;
+                forward(
+                    &mut swr,
+                    &ctx.expect_tx,
+                    &mut pending_resets,
+                    h.turn,
+                    h.seq,
+                    events,
+                )
+                .await?;
             }
             done = ctx.done_rx.recv() => {
                 match done {
@@ -475,40 +518,43 @@ async fn relay_client(
     }
 }
 
+#[derive(Default)]
+struct PendingResets {
+    statements: Vec<String>,
+    portals: Vec<String>,
+}
+
 async fn forward(
     swr: &mut OwnedWriteHalf,
     expect_tx: &mpsc::UnboundedSender<Expectation>,
+    pending_resets: &mut PendingResets,
     turn: WireTurn,
     seq: u64,
     gated: Option<EventTx>,
 ) -> WireResult<()> {
+    pending_resets.statements.extend(turn.reset_statements);
+    pending_resets.portals.extend(turn.reset_portals);
     // Drivers such as asyncpg and JDBC prepare with Parse/Describe/Flush and
     // only later Bind the statement; its row layout must be learned here or
     // those rows cannot be decoded.
-    let describe_only = turn.terminator == Terminator::Flush && turn.described_statement.is_some();
+    let describe_only = turn.terminator == Terminator::Flush && !turn.describes.is_empty();
+    let is_copy_flush = turn.terminator == Terminator::CopyFlush;
     if turn.terminator.expects_ready_for_query() || describe_only {
         // Must be registered before the bytes leave, so the response can never
         // overtake its expectation.
         let _ = expect_tx.send(Expectation {
             seq,
             gated,
-            described_statement: turn.described_statement.clone(),
-            result_shape: turn.result_shape.clone(),
+            describes: turn.describes,
+            result_shapes: turn.result_shapes,
+            reset_statements: std::mem::take(&mut pending_resets.statements),
+            reset_portals: std::mem::take(&mut pending_resets.portals),
             describe_only,
+            is_copy_flush,
         });
     }
     swr.write_all(&turn.raw).await?;
     Ok(())
-}
-
-fn shaped_columns(cols: &[ColumnDesc], formats: &[FormatCode]) -> Vec<ColumnDesc> {
-    cols.iter()
-        .enumerate()
-        .map(|(i, c)| ColumnDesc {
-            format: broadcast(formats, i),
-            ..c.clone()
-        })
-        .collect()
 }
 
 struct InFlight {
@@ -528,10 +574,11 @@ async fn relay_server(
 ) -> WireResult<()> {
     let mut pending: VecDeque<Expectation> = VecDeque::new();
     let mut current: Option<InFlight> = None;
-    // Row layout of prepared statements, learned from `Describe` responses, for
-    // executions that receive `DataRow`s without a `RowDescription`. Lookups
-    // only, so `HashMap` iteration order never matters.
+    // Row layout of prepared statements and bound portals, learned from
+    // `Describe` responses, for executions that receive `DataRow`s without a
+    // `RowDescription`. Lookups only, so `HashMap` iteration order never matters.
     let mut statement_columns: HashMap<String, Vec<ColumnDesc>> = HashMap::new();
+    let mut portal_columns: HashMap<String, PortalLayout> = HashMap::new();
     let mut out = BytesMut::new();
 
     while let Some(frame) = sreader.next().await? {
@@ -540,21 +587,26 @@ async fn relay_server(
         }
         if current.is_none() {
             current = pending.pop_front().map(|expectation| {
-                let collector = expectation
-                    .result_shape
-                    .as_ref()
-                    .and_then(|shape| {
-                        statement_columns
-                            .get(&shape.statement)
-                            .map(|cols| shaped_columns(cols, &shape.formats))
-                    })
-                    .map_or_else(ResponseCollector::new, ResponseCollector::with_columns)
-                    .with_bind_formats(
-                        expectation
-                            .result_shape
-                            .as_ref()
-                            .map(|shape| shape.formats.clone()),
-                    );
+                for stmt in &expectation.reset_statements {
+                    statement_columns.remove(stmt);
+                }
+                for portal in &expectation.reset_portals {
+                    portal_columns.remove(portal);
+                }
+                let mut stmt_layouts = HashMap::new();
+                let mut port_layouts = HashMap::new();
+                for shape in &expectation.result_shapes {
+                    if let Some(cols) = statement_columns.get(&shape.statement) {
+                        stmt_layouts.insert(shape.statement.clone(), cols.clone());
+                    }
+                    if let Some(entry) = portal_columns.get(&shape.portal) {
+                        port_layouts.insert(shape.portal.clone(), entry.clone());
+                    }
+                }
+                let collector = ResponseCollector::new()
+                    .with_layouts(stmt_layouts, port_layouts)
+                    .with_describes(expectation.describes.clone())
+                    .with_result_shapes(expectation.result_shapes.clone());
                 InFlight {
                     expectation,
                     collector,
@@ -578,16 +630,21 @@ async fn relay_server(
                     backend_tag::ROW_DESCRIPTION
                         | backend_tag::NO_DATA
                         | backend_tag::ERROR_RESPONSE
-                ));
+                )
+                && cur.collector.pending_describes_done());
         let supervised = cur.expectation.gated.is_some();
         if supervised && !cur.streaming {
             frame.encode(&mut cur.held);
             if matches!(
                 frame.tag,
-                backend_tag::COPY_IN_RESPONSE | backend_tag::COPY_BOTH_RESPONSE
-            ) {
-                // The client must see CopyInResponse to send its data; stream the
-                // remainder and hold back only the final ReadyForQuery.
+                backend_tag::COPY_IN_RESPONSE
+                    | backend_tag::COPY_OUT_RESPONSE
+                    | backend_tag::COPY_BOTH_RESPONSE
+            ) || (cur.expectation.is_copy_flush && frame.tag == backend_tag::ERROR_RESPONSE)
+            {
+                // The client must see CopyInResponse / CopyOutResponse (or an
+                // extended-COPY error) before sending CopyData and the closing
+                // Sync; stream intermediate frames and hold back ReadyForQuery.
                 out.extend_from_slice(&cur.held.split());
                 cur.streaming = true;
             }
@@ -603,15 +660,23 @@ async fn relay_server(
         }
 
         let Some(done) = current.take() else { continue };
-        if let (Some(name), Some(cols)) = (
-            done.expectation.described_statement.as_ref(),
-            done.collector.described(),
-        ) {
-            statement_columns.insert(name.clone(), cols.to_vec());
+        for (target, cols) in done.collector.described() {
+            match target {
+                DescribeTarget::Statement(name) => {
+                    statement_columns.insert(name.clone(), cols.clone());
+                }
+                DescribeTarget::Portal { portal, statement } => {
+                    portal_columns.insert(portal.clone(), (statement.clone(), cols.clone()));
+                }
+            }
         }
         let response = done.collector.finish();
         if let Some(status) = response.tx_status {
             shared.set_tx_status(status);
+            portal_columns.remove("");
+            if !status.in_transaction() {
+                portal_columns.clear();
+            }
         }
         if let Some(events) = done.expectation.gated {
             flush(&mut cwr, &mut out).await?;

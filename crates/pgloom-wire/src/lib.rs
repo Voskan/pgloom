@@ -34,4 +34,4 @@ pub use proxy::{
     TurnInfo, spawn_proxy,
 };
 pub use response::TurnResponse;
-pub use turn::{BoundStatement, WireTurn};
+pub use turn::{BoundStatement, DescribeTarget, WireTurn};

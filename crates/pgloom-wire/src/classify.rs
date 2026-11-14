@@ -218,6 +218,21 @@ pub fn classify_sql(sql: &str) -> TurnMeta {
     meta
 }
 
+/// Whether `sql` contains a top-level `COPY` statement, which enters the
+/// `CopyIn` / `CopyOut` wire subprotocol when executed.
+pub fn is_copy_sql(sql: &str) -> bool {
+    tokenize(sql)
+        .split(|t| *t == Token::Symbol(';'))
+        .filter(|stmt| !stmt.is_empty())
+        .any(|stmt| {
+            let start = stmt
+                .iter()
+                .position(|t| *t != Token::Symbol('('))
+                .unwrap_or(stmt.len());
+            stmt.get(start).is_some_and(|t| t.is_word("copy"))
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Token {
     /// Unquoted identifier or keyword, lowercased.

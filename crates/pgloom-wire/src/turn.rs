@@ -5,12 +5,12 @@
 //! PostgreSQL produces exactly one `ReadyForQuery` per turn, so a turn's
 //! completion is observable on the backend stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
-use crate::classify::{StatementKind, TurnMeta, classify_sql};
+use crate::classify::{StatementKind, TurnMeta, classify_sql, is_copy_sql};
 use crate::error::WireResult;
 use crate::frame::Frame;
 use crate::messages::{
@@ -26,6 +26,18 @@ pub struct BoundStatement {
     pub params: Vec<String>,
 }
 
+/// Object inspected by a `Describe` (`'D'`) message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DescribeTarget {
+    Statement(String),
+    Portal {
+        portal: String,
+        /// Backing prepared statement when the portal was bound on this
+        /// connection.
+        statement: Option<String>,
+    },
+}
+
 /// How a turn was terminated by the client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Terminator {
@@ -35,6 +47,10 @@ pub enum Terminator {
     Sync,
     /// `'F'`: legacy function call; one `ReadyForQuery` follows.
     FunctionCall,
+    /// `'H'` after executing `COPY`: the client waits for `CopyInResponse` /
+    /// `CopyOutResponse` before sending `CopyData` and the closing `Sync` that
+    /// produces `ReadyForQuery`.
+    CopyFlush,
     /// `'H'` with no pending `Execute`: responses are flushed, no `ReadyForQuery`.
     Flush,
     /// `'X'`: the client is closing the connection.
@@ -45,7 +61,7 @@ impl Terminator {
     pub fn expects_ready_for_query(self) -> bool {
         matches!(
             self,
-            Terminator::Query | Terminator::Sync | Terminator::FunctionCall
+            Terminator::Query | Terminator::Sync | Terminator::FunctionCall | Terminator::CopyFlush
         )
     }
 }
@@ -58,16 +74,20 @@ pub struct WireTurn {
     pub terminator: Terminator,
     pub statements: Vec<BoundStatement>,
     pub meta: TurnMeta,
-    /// Prepared statement whose `Describe` this turn sends; its
-    /// `RowDescription` tells how later executions encode their rows.
-    pub described_statement: Option<String>,
-    /// Statement and result formats of the last `Execute` in the turn.
-    pub result_shape: Option<ResultShape>,
+    /// Objects whose `Describe` this turn sends, in wire order.
+    pub describes: VecDeque<DescribeTarget>,
+    /// Portal, statement and result formats of each `Execute` in wire order.
+    pub result_shapes: VecDeque<ResultShape>,
+    /// Statements re-parsed or closed in this turn (invalidating cached layouts).
+    pub reset_statements: Vec<String>,
+    /// Portals re-bound or closed in this turn (invalidating cached layouts).
+    pub reset_portals: Vec<String>,
 }
 
 /// How the rows of an executed portal are encoded, as requested by `Bind`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultShape {
+    pub portal: String,
     pub statement: String,
     pub formats: Vec<FormatCode>,
 }
@@ -156,6 +176,7 @@ impl PreparedStatementRegistry {
             })
             .collect();
         let shape = ResultShape {
+            portal: msg.portal.clone(),
             statement: msg.statement.clone(),
             formats: msg.result_formats.clone(),
         };
@@ -188,8 +209,13 @@ pub struct TurnAssembler {
     statements: Vec<BoundStatement>,
     meta: TurnMeta,
     has_execute: bool,
-    described_statement: Option<String>,
-    result_shape: Option<ResultShape>,
+    has_copy_execute: bool,
+    last_turn_extended_copy: bool,
+    awaiting_copy_sync: bool,
+    describes: VecDeque<DescribeTarget>,
+    result_shapes: VecDeque<ResultShape>,
+    reset_statements: Vec<String>,
+    reset_portals: Vec<String>,
 }
 
 impl TurnAssembler {
@@ -208,10 +234,39 @@ impl TurnAssembler {
 
     /// Feeds one client frame; returns a unit once one is complete.
     pub fn push(&mut self, frame: Frame) -> WireResult<Option<ClientUnit>> {
-        match frame.tag {
-            tag::COPY_DATA | tag::COPY_DONE | tag::COPY_FAIL => {
-                return Ok(Some(ClientUnit::CopyFrame(frame)));
+        if matches!(frame.tag, tag::COPY_DATA | tag::COPY_DONE | tag::COPY_FAIL) {
+            if matches!(frame.tag, tag::COPY_DONE | tag::COPY_FAIL) && self.last_turn_extended_copy
+            {
+                // Drivers such as tokio-postgres start extended COPY IN with
+                // Bind + Execute + Sync (which PostgreSQL ignores inside COPY
+                // mode) and send a second Sync after CopyDone / CopyFail.
+                self.last_turn_extended_copy = false;
+                self.awaiting_copy_sync = true;
             }
+            return Ok(Some(ClientUnit::CopyFrame(frame)));
+        }
+        self.last_turn_extended_copy = false;
+        if self.awaiting_copy_sync && self.pending_frames == 0 {
+            match frame.tag {
+                tag::FLUSH => return Ok(Some(ClientUnit::CopyFrame(frame))),
+                tag::CLOSE => {
+                    let target = ObjectRef::decode(&frame)?;
+                    match &target {
+                        ObjectRef::Statement(name) => self.reset_statements.push(name.clone()),
+                        ObjectRef::Portal(name) => self.reset_portals.push(name.clone()),
+                    }
+                    self.registry.on_close(target);
+                    return Ok(Some(ClientUnit::CopyFrame(frame)));
+                }
+                tag::SYNC => {
+                    self.awaiting_copy_sync = false;
+                    return Ok(Some(ClientUnit::CopyFrame(frame)));
+                }
+                _ => self.awaiting_copy_sync = false,
+            }
+        }
+
+        match frame.tag {
             tag::QUERY => {
                 let sql = decode_query(&frame)?;
                 self.meta.extend(classify_sql(&sql));
@@ -224,32 +279,49 @@ impl TurnAssembler {
             }
             tag::PARSE => {
                 let msg = ParseMessage::decode(&frame)?;
+                self.reset_statements.push(msg.statement.clone());
                 self.registry.on_parse(msg);
             }
             tag::BIND => {
                 let msg = BindMessage::decode(&frame)?;
+                self.reset_portals.push(msg.portal.clone());
                 self.registry.on_bind(&msg);
             }
             tag::CLOSE => {
                 let target = ObjectRef::decode(&frame)?;
+                match &target {
+                    ObjectRef::Statement(name) => self.reset_statements.push(name.clone()),
+                    ObjectRef::Portal(name) => self.reset_portals.push(name.clone()),
+                }
                 self.registry.on_close(target);
             }
-            tag::DESCRIBE => {
-                if let ObjectRef::Statement(name) = ObjectRef::decode(&frame)? {
-                    self.described_statement = Some(name);
+            tag::DESCRIBE => match ObjectRef::decode(&frame)? {
+                ObjectRef::Statement(name) => {
+                    self.describes.push_back(DescribeTarget::Statement(name));
                 }
-            }
+                ObjectRef::Portal(portal) => {
+                    let statement = self
+                        .registry
+                        .portal(&portal)
+                        .map(|p| p.shape.statement.clone());
+                    self.describes
+                        .push_back(DescribeTarget::Portal { portal, statement });
+                }
+            },
             tag::EXECUTE => {
                 let msg = ExecuteMessage::decode(&frame)?;
                 self.has_execute = true;
                 match self.registry.portal(&msg.portal) {
                     Some(portal) => {
-                        self.result_shape = Some(portal.shape.clone());
-                        self.meta.extend(classify_sql(&portal.sql));
-                        self.statements.push(BoundStatement {
-                            sql: portal.sql.clone(),
-                            params: portal.params.clone(),
-                        });
+                        let sql = portal.sql.clone();
+                        let params = portal.params.clone();
+                        let shape = portal.shape.clone();
+                        if is_copy_sql(&sql) {
+                            self.has_copy_execute = true;
+                        }
+                        self.result_shapes.push_back(shape);
+                        self.meta.extend(classify_sql(&sql));
+                        self.statements.push(BoundStatement { sql, params });
                     }
                     None => {
                         self.meta.push(StatementKind::DataWrite {
@@ -283,6 +355,14 @@ impl TurnAssembler {
                 self.append(&frame);
                 return Ok(Some(self.finish(Terminator::Terminate)));
             }
+            tag::FLUSH if self.has_copy_execute => {
+                // Extended-protocol COPY sends Execute + Flush and waits for
+                // CopyInResponse / CopyOutResponse before sending CopyData and
+                // the closing Sync.
+                self.append(&frame);
+                self.awaiting_copy_sync = true;
+                return Ok(Some(self.finish(Terminator::CopyFlush)));
+            }
             tag::FLUSH if !self.has_execute => {
                 // Describe-before-Sync round trips (e.g. JDBC) must not wait for
                 // a Sync the client will only send after seeing the response.
@@ -311,10 +391,14 @@ impl TurnAssembler {
             terminator,
             statements: std::mem::take(&mut self.statements),
             meta,
-            described_statement: self.described_statement.take(),
-            result_shape: self.result_shape.take(),
+            describes: std::mem::take(&mut self.describes),
+            result_shapes: std::mem::take(&mut self.result_shapes),
+            reset_statements: std::mem::take(&mut self.reset_statements),
+            reset_portals: std::mem::take(&mut self.reset_portals),
         };
+        self.last_turn_extended_copy = terminator == Terminator::Sync && self.has_copy_execute;
         self.has_execute = false;
+        self.has_copy_execute = false;
         ClientUnit::Turn(turn)
     }
 }
@@ -440,8 +524,11 @@ mod tests {
             ],
         );
         let t1 = turn(&t1[0]);
-        assert_eq!(t1.described_statement.as_deref(), Some("s0"));
-        assert!(t1.result_shape.is_none());
+        assert_eq!(
+            t1.describes,
+            VecDeque::from([DescribeTarget::Statement("s0".into())])
+        );
+        assert!(t1.result_shapes.is_empty());
         let mut bind = BytesMut::from(&build::bind("", "s0", &[Some(b"1")]).body[..]);
         // Replace the trailing "0 result formats" with "1 format: binary".
         bind.truncate(bind.len() - 2);
@@ -455,14 +542,122 @@ mod tests {
             ],
         );
         let t2 = turn(&t2[0]);
-        assert_eq!(t2.described_statement, None);
+        assert!(t2.describes.is_empty());
         assert_eq!(
-            t2.result_shape,
-            Some(ResultShape {
+            t2.result_shapes,
+            VecDeque::from([ResultShape {
+                portal: String::new(),
                 statement: "s0".into(),
                 formats: vec![FormatCode::Binary],
-            })
+            }])
         );
+    }
+
+    #[test]
+    fn preserves_pipelined_describes_and_portal_targets() {
+        let mut asm = TurnAssembler::new();
+        let units = feed(
+            &mut asm,
+            &[
+                build::parse("s1", "SELECT balance FROM wallets WHERE id = $1", &[23]),
+                build::describe_statement("s1"),
+                build::parse("s2", "UPDATE wallets SET balance = 0 WHERE id = $1", &[23]),
+                build::describe_statement("s2"),
+                build::bind("p1", "s1", &[Some(b"1")]),
+                build::describe_portal("p1"),
+                build::flush(),
+            ],
+        );
+        let t = turn(&units[0]);
+        assert_eq!(t.terminator, Terminator::Flush);
+        assert_eq!(
+            t.describes,
+            VecDeque::from([
+                DescribeTarget::Statement("s1".into()),
+                DescribeTarget::Statement("s2".into()),
+                DescribeTarget::Portal {
+                    portal: "p1".into(),
+                    statement: Some("s1".into()),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn extended_copy_flush_emits_turn_and_streams_closing_sync() {
+        let mut asm = TurnAssembler::new();
+        let units = feed(
+            &mut asm,
+            &[
+                build::parse("", "COPY wallets FROM STDIN", &[]),
+                build::bind("", "", &[]),
+                build::execute("", 0),
+                build::flush(),
+            ],
+        );
+        assert_eq!(units.len(), 1);
+        let t = turn(&units[0]);
+        assert_eq!(t.terminator, Terminator::CopyFlush);
+        assert!(t.terminator.expects_ready_for_query());
+        assert_eq!(
+            t.meta.kind(),
+            TurnKind::DataWrite {
+                target_tables: vec!["wallets".into()]
+            }
+        );
+
+        let tail = feed(
+            &mut asm,
+            &[
+                Frame::new(tag::COPY_DATA, Bytes::from_static(b"1\t100\n")),
+                Frame::new(tag::COPY_DONE, Bytes::new()),
+                build::sync(),
+            ],
+        );
+        assert_eq!(tail.len(), 3);
+        assert!(tail.iter().all(|u| matches!(u, ClientUnit::CopyFrame(_))));
+
+        let next = feed(&mut asm, &[build::query("SELECT 1")]);
+        assert_eq!(turn(&next[0]).sql_text(), "SELECT 1");
+    }
+
+    #[test]
+    fn extended_copy_sync_streams_post_copy_done_sync() {
+        let mut asm = TurnAssembler::new();
+        let units = feed(
+            &mut asm,
+            &[
+                build::parse("s0", "COPY wallets FROM STDIN", &[]),
+                build::describe_statement("s0"),
+                build::sync(),
+            ],
+        );
+        assert_eq!(units.len(), 1);
+
+        let copy_turn = feed(
+            &mut asm,
+            &[
+                build::bind("", "s0", &[]),
+                build::execute("", 0),
+                build::sync(),
+            ],
+        );
+        assert_eq!(copy_turn.len(), 1);
+        assert_eq!(turn(&copy_turn[0]).terminator, Terminator::Sync);
+
+        let tail = feed(
+            &mut asm,
+            &[
+                Frame::new(tag::COPY_DATA, Bytes::from_static(b"1\t100\n")),
+                Frame::new(tag::COPY_DONE, Bytes::new()),
+                build::sync(),
+            ],
+        );
+        assert_eq!(tail.len(), 3);
+        assert!(tail.iter().all(|u| matches!(u, ClientUnit::CopyFrame(_))));
+
+        let next = feed(&mut asm, &[build::query("SELECT 1")]);
+        assert_eq!(turn(&next[0]).sql_text(), "SELECT 1");
     }
 
     #[test]

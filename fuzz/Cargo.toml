@@ -1,0 +1,40 @@
+[package]
+name = "pgloom-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1.12"
+libfuzzer-sys = "0.4"
+pgloom-engine = { path = "../crates/pgloom-engine" }
+pgloom-report = { path = "../crates/pgloom-report" }
+pgloom-wire = { path = "../crates/pgloom-wire" }
+
+[workspace]
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "classify_sql"
+path = "fuzz_targets/classify_sql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "advisor_advise"
+path = "fuzz_targets/advisor_advise.rs"
+test = false
+doc = false
+bench = false

@@ -33,3 +33,9 @@ __pycache__/
 
 # Replay files written by `pgloom run`
 .pgloom-repro.json
+
+# cargo-fuzz outputs
+/fuzz/Cargo.lock
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/

@@ -8,7 +8,7 @@ use pgloom_wire::classify_sql;
 use serde::Serialize;
 
 use crate::style::one_line;
-use crate::timeline::first_keyword;
+use crate::timeline::{first_keyword, strip_leading_comments};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -155,8 +155,8 @@ pub fn advise(record: &EpisodeRecord, violations: &[Violation], names: &[String]
     } else {
         format!("Worker {who}")
     };
-    let read = one_line(first.read).trim_end_matches(';').to_owned();
-    let write = one_line(first.write).trim_end_matches(';').to_owned();
+    let read = clean_sql(first.read).trim_end_matches(';').to_owned();
+    let write = clean_sql(first.write).trim_end_matches(';').to_owned();
     let table = &first.table;
 
     if first_keyword(first.write) == "INSERT" {
@@ -167,7 +167,7 @@ pub fn advise(record: &EpisodeRecord, violations: &[Violation], names: &[String]
         };
         let mut fixes = Vec::new();
         if let Some(parent) = first.parent {
-            let parent = one_line(parent).trim_end_matches(';').to_owned();
+            let parent = clean_sql(parent).trim_end_matches(';').to_owned();
             let parent_table = classify_sql(&parent)
                 .read_tables()
                 .into_iter()
@@ -340,11 +340,11 @@ fn option(index: usize) -> char {
 /// The read cannot take a row lock as written: PostgreSQL rejects `FOR
 /// UPDATE` together with aggregates, `GROUP BY`, `HAVING` or `DISTINCT`.
 fn is_aggregate_read(sql: &str) -> bool {
-    let flat = one_line(sql).to_ascii_lowercase();
+    let flat = clean_sql(sql);
     let Some(from) = find_top_level(&flat, " from ") else {
         return false;
     };
-    let projection = &flat[..from];
+    let projection = flat[..from].to_ascii_lowercase();
     let compact: String = projection.chars().filter(|c| !c.is_whitespace()).collect();
     [
         "count(",
@@ -371,17 +371,18 @@ fn is_aggregate_read(sql: &str) -> bool {
 /// `SELECT count(*) FROM t WHERE p` becomes `SELECT 1 FROM t WHERE p FOR NO
 /// KEY UPDATE;`. Returns `None` for set operations, which cannot be locked.
 fn lock_rows_read(sql: &str) -> Option<String> {
-    let flat = one_line(sql);
+    let flat = clean_sql(sql);
     let flat = flat.trim_end_matches(';');
-    let lower = flat.to_ascii_lowercase();
-    if !lower.starts_with("select ")
+    if !flat
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("select "))
         || [" union ", " intersect ", " except "]
             .iter()
-            .any(|op| find_top_level(&lower, op).is_some())
+            .any(|op| find_top_level(flat, op).is_some())
     {
         return None;
     }
-    let from = find_top_level(&lower, " from ")?;
+    let from = find_top_level(flat, " from ")?;
     let end = [
         " group by ",
         " having ",
@@ -390,7 +391,7 @@ fn lock_rows_read(sql: &str) -> Option<String> {
         " offset ",
     ]
     .iter()
-    .filter_map(|k| find_top_level(&lower, k))
+    .filter_map(|k| find_top_level(flat, k))
     .min()
     .unwrap_or(flat.len());
     Some(format!("SELECT 1{} FOR NO KEY UPDATE;", &flat[from..end]))
@@ -422,8 +423,13 @@ fn is_write_skew(first: &ReadThenWrite<'_>, found: &[(WorkerId, ReadThenWrite<'_
 /// The read's `WHERE` clause compares against a bind parameter, so the
 /// workers may have checked different rows on purpose.
 fn where_reads_params(sql: &str) -> bool {
-    let flat = one_line(sql);
-    find_top_level(&flat.to_ascii_lowercase(), " where ").is_some_and(|w| flat[w..].contains('$'))
+    let flat = clean_sql(sql);
+    find_top_level(&flat, " where ").is_some_and(|w| {
+        let tail = &flat[w..];
+        top_level_offsets(tail)
+            .into_iter()
+            .any(|i| tail.as_bytes()[i] == b'$')
+    })
 }
 
 /// For an absolute `SET c = $1 WHERE p`, proposes the in-SQL increment
@@ -483,35 +489,201 @@ fn lock_order(
     }
 }
 
-/// Byte offsets of `s` that lie outside parentheses and single-quoted
-/// literals. Parentheses and quotes themselves are never reported.
+/// Strips leading SQL comments and collapses the statement onto a single line,
+/// replacing any inline `-- ... \n` comments with spaces so collapsing newlines
+/// never comments out the rest of the statement.
+fn clean_sql(sql: &str) -> String {
+    let s = strip_leading_comments(sql);
+    if !s.contains("--") {
+        return one_line(s);
+    }
+    let bytes = s.as_bytes();
+    let mut stripped = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            stripped.push(' ');
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += s[i..].chars().next().map_or(1, char::len_utf8);
+            }
+            continue;
+        }
+        if (b == b'e' || b == b'E')
+            && bytes.get(i + 1) == Some(&b'\'')
+            && !i
+                .checked_sub(1)
+                .is_some_and(|p| bytes[p].is_ascii_alphanumeric() || bytes[p] == b'_')
+        {
+            let end = skip_single_quoted(s, i + 2, true);
+            stripped.push_str(&s[i..end]);
+            i = end;
+            continue;
+        }
+        if b == b'\'' {
+            let end = skip_single_quoted(s, i + 1, false);
+            stripped.push_str(&s[i..end]);
+            i = end;
+            continue;
+        }
+        if b == b'"' {
+            let end = skip_double_quoted(s, i + 1);
+            stripped.push_str(&s[i..end]);
+            i = end;
+            continue;
+        }
+        if b == b'$'
+            && !bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
+            && let Some(end) = skip_dollar_quoted(s, i)
+        {
+            stripped.push_str(&s[i..end]);
+            i = end;
+            continue;
+        }
+        if let Some(ch) = s[i..].chars().next() {
+            stripped.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    one_line(&stripped)
+}
+
+fn skip_single_quoted(s: &str, mut i: usize, backslash_escapes: bool) -> usize {
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        if backslash_escapes && bytes[i] == b'\\' {
+            i += 1;
+            if i < bytes.len() {
+                i += s[i..].chars().next().map_or(1, char::len_utf8);
+            }
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            if bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += s[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    i
+}
+
+fn skip_double_quoted(s: &str, mut i: usize) -> usize {
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            if bytes.get(i + 1) == Some(&b'"') {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += s[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    i
+}
+
+fn skip_dollar_quoted(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut j = start + 1;
+    while j < bytes.len() {
+        let ch = s[j..].chars().next()?;
+        if ch == '$' {
+            let delim = &s[start..=j];
+            let body_start = j + 1;
+            return match s[body_start..].find(delim) {
+                Some(rel) => Some(body_start + rel + delim.len()),
+                None => Some(s.len()),
+            };
+        }
+        if ch.is_alphanumeric() || ch == '_' {
+            j += ch.len_utf8();
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+/// UTF-8 char-boundary offsets of `s` that lie outside parentheses, comments,
+/// quoted identifiers, and single/escape/dollar-quoted string literals.
 fn top_level_offsets(s: &str) -> Vec<usize> {
     let bytes = s.as_bytes();
     let mut out = Vec::new();
     let mut depth = 0usize;
-    let mut in_str = false;
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        if in_str {
-            if b == b'\'' {
-                if bytes.get(i + 1) == Some(&b'\'') {
-                    i += 2;
-                    continue;
-                }
-                in_str = false;
+        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += s[i..].chars().next().map_or(1, char::len_utf8);
             }
-            i += 1;
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let mut cdepth = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    cdepth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    cdepth -= 1;
+                    i += 2;
+                    if cdepth == 0 {
+                        break;
+                    }
+                } else {
+                    i += s[i..].chars().next().map_or(1, char::len_utf8);
+                }
+            }
+            continue;
+        }
+        if (b == b'e' || b == b'E')
+            && bytes.get(i + 1) == Some(&b'\'')
+            && !i
+                .checked_sub(1)
+                .is_some_and(|p| bytes[p].is_ascii_alphanumeric() || bytes[p] == b'_')
+        {
+            i = skip_single_quoted(s, i + 2, true);
+            continue;
+        }
+        if b == b'\'' {
+            i = skip_single_quoted(s, i + 1, false);
+            continue;
+        }
+        if b == b'"' {
+            i = skip_double_quoted(s, i + 1);
+            continue;
+        }
+        if b == b'$'
+            && !bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
+            && let Some(end) = skip_dollar_quoted(s, i)
+        {
+            i = end;
             continue;
         }
         match b {
-            b'\'' => in_str = true,
-            b'(' => depth += 1,
-            b')' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => out.push(i),
-            _ => {}
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => {
+                if depth == 0 {
+                    out.push(i);
+                }
+                i += s[i..].chars().next().map_or(1, char::len_utf8);
+            }
         }
-        i += 1;
     }
     out
 }
@@ -585,9 +757,12 @@ impl SplitUpdate {
 /// Parses an `UPDATE` into `head`, `SET`, optional `FROM`, optional `WHERE`,
 /// and optional `RETURNING` clauses at top level.
 fn split_update(sql: &str) -> Option<SplitUpdate> {
-    let flat = one_line(sql);
+    let flat = clean_sql(sql);
     let flat = flat.trim_end_matches(';');
-    if flat.len() < 7 || !flat[..7].eq_ignore_ascii_case("UPDATE ") {
+    if !flat
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("UPDATE "))
+    {
         return None;
     }
     let (without_ret, returning) = split_returning(flat);
@@ -618,7 +793,7 @@ fn append_where_guard(sql: &str, guard: &str) -> String {
     match split_update(sql) {
         Some(u) => u.render_with_guard(guard),
         None => {
-            let flat = one_line(sql);
+            let flat = clean_sql(sql);
             let (body, ret) = split_returning(flat.trim_end_matches(';'));
             let joiner = if find_top_level(body, " WHERE ").is_some() {
                 "AND"
@@ -634,8 +809,12 @@ fn append_where_guard(sql: &str, guard: &str) -> String {
 fn assignments(set: &str) -> Vec<(String, String)> {
     split_top_level_commas(set)
         .into_iter()
-        .filter_map(|a| a.split_once('='))
-        .map(|(c, e)| (c.trim().to_owned(), e.trim().to_owned()))
+        .filter_map(|a| {
+            let eq = top_level_offsets(a)
+                .into_iter()
+                .find(|&i| a.as_bytes()[i] == b'=')?;
+            Some((a[..eq].trim().to_owned(), a[eq + 1..].trim().to_owned()))
+        })
         .collect()
 }
 
@@ -653,31 +832,43 @@ fn is_absolute_assignment(sql: &str) -> bool {
 /// `$1`, `$1::INTEGER`, `CAST($1 AS numeric)`, `42`, `'text'`, `true`.
 fn is_constant(expr: &str) -> bool {
     let mut e = expr.trim();
-    let lower = e.to_ascii_lowercase();
-    if lower.starts_with("cast(") && e.ends_with(')') {
-        let inner = &e[5..e.len() - 1];
-        return find_top_level(&inner.to_ascii_lowercase(), " as ")
-            .is_some_and(|p| is_constant(&inner[..p]));
-    }
-    if let Some(p) = top_level_offsets(e)
-        .into_iter()
-        .find(|&i| e.get(i..i + 2) == Some("::"))
-    {
-        let type_name = &e[p + 2..];
-        let is_type = type_name.chars().all(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(c, '_' | ' ' | '.' | '"' | ':' | '[' | ']' | '(' | ')' | ',')
-        });
-        if !is_type {
-            return false;
+    loop {
+        if e.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("cast(")) && e.ends_with(')') {
+            let Some(inner) = e.get(5..e.len().saturating_sub(1)) else {
+                return false;
+            };
+            let Some(p) = find_top_level(inner, " as ") else {
+                return false;
+            };
+            e = inner[..p].trim();
+            continue;
         }
-        e = e[..p].trim();
+        if let Some(p) = top_level_offsets(e)
+            .into_iter()
+            .find(|&i| e.get(i..i + 2) == Some("::"))
+        {
+            let type_name = &e[p + 2..];
+            let is_type = !type_name.trim().is_empty()
+                && type_name.chars().all(|c| {
+                    c.is_ascii_alphanumeric()
+                        || matches!(c, '_' | ' ' | '.' | '"' | ':' | '[' | ']' | '(' | ')' | ',')
+                });
+            if !is_type {
+                return false;
+            }
+            e = e[..p].trim();
+            continue;
+        }
+        break;
     }
     let lower = e.to_ascii_lowercase();
     e.strip_prefix('$')
         .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
         || e.parse::<f64>().is_ok()
-        || (e.starts_with('\'') && top_level_offsets(e).is_empty())
+        || ((e.starts_with('\'')
+            || e.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("e'"))
+            || (e.starts_with('$') && !e.as_bytes().get(1).is_some_and(u8::is_ascii_digit)))
+            && top_level_offsets(e).is_empty())
         || matches!(lower.as_str(), "true" | "false" | "null")
 }
 
@@ -1002,5 +1193,39 @@ mod tests {
             append_where_guard("DELETE FROM holds WHERE id = $1", "expires_at < now()"),
             "DELETE FROM holds WHERE id = $1 AND expires_at < now();"
         );
+    }
+
+    #[test]
+    fn survives_multibyte_utf8_comments_and_wild_orm_identifiers() {
+        // Multibyte UTF-8 where byte 7 falls inside a 3-byte codepoint used to
+        // panic in `split_update`.
+        let utf8 = record(&[
+            (0, "SELECT 残高 FROM 口座 WHERE id = 1"),
+            (0, "アップデート 口座"),
+            (0, "UPDATE\u{00A0}口座 SET 残高 = 0"),
+        ]);
+        let _ = advise(&utf8, &[], &names());
+
+        // Prisma / Hibernate style: leading sqlcommenter block comments, `--`
+        // line comments, quoted identifiers containing commas/keywords, E'...'
+        // escapes, and dollar-quoted literals.
+        let orm = record(&[
+            (
+                0,
+                "/* prisma:read */\n-- load wallet\nSELECT \"balance,usd\" FROM \"public\".\"Wallet\" WHERE \"id\" = $1",
+            ),
+            (
+                0,
+                "/* hibernate */ UPDATE \"public\".\"Wallet\" SET \"balance,usd\" = CAST($1:: numeric AS numeric), \"note\" = E'it\\'s, FROM x', \"tag\" = $q$ SET , WHERE $q$ WHERE \"id\" = $2",
+            ),
+        ]);
+        let advice = advise(&orm, &[], &names());
+        assert_eq!(advice.len(), 1);
+        assert_eq!(advice[0].pattern, Pattern::LostUpdate);
+        assert!(
+            advice[0].fixes[0].sql[0]
+                .starts_with("SELECT \"balance,usd\" FROM \"public\".\"Wallet\"")
+        );
+        assert!(advice[0].fixes[1].sql[0].contains("\"balance,usd\" = \"balance,usd\" + <delta>"));
     }
 }

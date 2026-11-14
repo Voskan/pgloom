@@ -362,3 +362,483 @@ async fn connection_close_is_reported() {
         }
     }
 }
+
+fn bind_with_result_formats(
+    portal: &str,
+    statement: &str,
+    params: &[Option<&[u8]>],
+    result_formats: &[i16],
+) -> pgloom_wire::frame::Frame {
+    use bytes::BufMut;
+    let base = pgloom_wire::messages::build::bind(portal, statement, params);
+    let mut body = bytes::BytesMut::from(&base.body[..base.body.len() - 2]);
+    body.put_i16(result_formats.len() as i16);
+    for fmt in result_formats {
+        body.put_i16(*fmt);
+    }
+    pgloom_wire::frame::Frame::new(pgloom_wire::messages::tag::BIND, body.freeze())
+}
+
+fn binary_data_row(cols: &[&[u8]]) -> pgloom_wire::frame::Frame {
+    use bytes::BufMut;
+    let mut body = bytes::BytesMut::new();
+    body.put_i16(cols.len() as i16);
+    for col in cols {
+        body.put_i32(col.len() as i32);
+        body.put_slice(col);
+    }
+    pgloom_wire::frame::Frame::new(pgloom_wire::messages::backend_tag::DATA_ROW, body.freeze())
+}
+
+#[tokio::test]
+async fn pipelined_describes_and_portal_describe_decode_binary_rows() {
+    use bytes::BytesMut;
+    use pgloom_wire::error::Peer;
+    use pgloom_wire::frame::encode_startup;
+    use pgloom_wire::io::FrameReader;
+    use pgloom_wire::messages::{backend_tag, build, tag};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let (rd, mut wr) = sock.into_split();
+        let mut reader = FrameReader::new(rd, Peer::Client);
+        let _ = reader.next_startup().await.unwrap().unwrap();
+
+        let mut init = BytesMut::new();
+        build::authentication_ok().encode(&mut init);
+        build::backend_key_data(5100, 99).encode(&mut init);
+        build::ready_for_query(TxStatus::Idle).encode(&mut init);
+        wr.write_all(&init).await.unwrap();
+
+        // Batch 1: Parse(s1) + Describe(Statement s1) + Parse(s2) + Describe(Statement s2) + Flush
+        for expected in [
+            tag::PARSE,
+            tag::DESCRIBE,
+            tag::PARSE,
+            tag::DESCRIBE,
+            tag::FLUSH,
+        ] {
+            let f = reader.next().await.unwrap().unwrap();
+            assert_eq!(f.tag, expected);
+        }
+        let mut resp = BytesMut::new();
+        build::parse_complete().encode(&mut resp);
+        build::row_description(&[("balance", 20)]).encode(&mut resp);
+        build::parse_complete().encode(&mut resp);
+        build::no_data().encode(&mut resp);
+        wr.write_all(&resp).await.unwrap();
+
+        // Batch 2: Bind("", s1, binary result) + Execute("") + Sync
+        for expected in [tag::BIND, tag::EXECUTE, tag::SYNC] {
+            let f = reader.next().await.unwrap().unwrap();
+            assert_eq!(f.tag, expected);
+        }
+        let mut resp = BytesMut::new();
+        build::bind_complete().encode(&mut resp);
+        binary_data_row(&[&420i64.to_be_bytes()]).encode(&mut resp);
+        build::command_complete("SELECT 1").encode(&mut resp);
+        build::ready_for_query(TxStatus::Idle).encode(&mut resp);
+        wr.write_all(&resp).await.unwrap();
+
+        // Batch 3: Parse(s3) + Bind(p3, s3, binary result) + Describe(Portal p3) + Flush
+        for expected in [tag::PARSE, tag::BIND, tag::DESCRIBE, tag::FLUSH] {
+            let f = reader.next().await.unwrap().unwrap();
+            assert_eq!(f.tag, expected);
+        }
+        let mut resp = BytesMut::new();
+        build::parse_complete().encode(&mut resp);
+        build::bind_complete().encode(&mut resp);
+        build::row_description(&[("stock", 23)]).encode(&mut resp);
+        wr.write_all(&resp).await.unwrap();
+
+        // Batch 4: Execute(p3) + Sync
+        for expected in [tag::EXECUTE, tag::SYNC] {
+            let f = reader.next().await.unwrap().unwrap();
+            assert_eq!(f.tag, expected);
+        }
+        let mut resp = BytesMut::new();
+        binary_data_row(&[&19i32.to_be_bytes()]).encode(&mut resp);
+        build::command_complete("SELECT 1").encode(&mut resp);
+        build::ready_for_query(TxStatus::Idle).encode(&mut resp);
+        wr.write_all(&resp).await.unwrap();
+
+        let term = reader.next().await.unwrap().unwrap();
+        assert_eq!(term.tag, tag::TERMINATE);
+    });
+
+    let proxy = spawn_proxy(ProxyConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        upstream: upstream_addr.to_string(),
+    })
+    .await
+    .unwrap();
+    let mut ctl = Controller::new(proxy.gate().open_episode());
+
+    let client = tokio::spawn({
+        let addr = proxy.local_addr();
+        async move {
+            let sock = TcpStream::connect(addr).await.unwrap();
+            let (rd, mut wr) = sock.into_split();
+            let mut reader = FrameReader::new(rd, Peer::Server);
+            wr.write_all(&encode_startup(&[("user", "test"), ("database", "test")]))
+                .await
+                .unwrap();
+            loop {
+                let f = reader.next().await.unwrap().unwrap();
+                if f.tag == backend_tag::READY_FOR_QUERY {
+                    break;
+                }
+            }
+
+            // Pipelined multi-Describe + Flush.
+            let mut b1 = BytesMut::new();
+            build::parse("s1", "SELECT balance FROM wallets WHERE id = $1", &[23]).encode(&mut b1);
+            build::describe_statement("s1").encode(&mut b1);
+            build::parse("s2", "UPDATE wallets SET balance = 0 WHERE id = $1", &[23])
+                .encode(&mut b1);
+            build::describe_statement("s2").encode(&mut b1);
+            build::flush().encode(&mut b1);
+            wr.write_all(&b1).await.unwrap();
+            for expected in [
+                backend_tag::PARSE_COMPLETE,
+                backend_tag::ROW_DESCRIPTION,
+                backend_tag::PARSE_COMPLETE,
+                backend_tag::NO_DATA,
+            ] {
+                let f = reader.next().await.unwrap().unwrap();
+                assert_eq!(f.tag, expected);
+            }
+
+            // Execute s1 with binary result format (no new Describe!).
+            let mut b2 = BytesMut::new();
+            bind_with_result_formats("", "s1", &[Some(b"1")], &[1]).encode(&mut b2);
+            build::execute("", 0).encode(&mut b2);
+            build::sync().encode(&mut b2);
+            wr.write_all(&b2).await.unwrap();
+            loop {
+                let f = reader.next().await.unwrap().unwrap();
+                if f.tag == backend_tag::READY_FOR_QUERY {
+                    break;
+                }
+            }
+
+            // Bind(p3) + Describe(Portal p3) + Flush, then Execute(p3) + Sync.
+            let mut b3 = BytesMut::new();
+            build::parse("s3", "SELECT stock FROM items WHERE id = $1", &[23]).encode(&mut b3);
+            bind_with_result_formats("p3", "s3", &[Some(b"1")], &[1]).encode(&mut b3);
+            build::describe_portal("p3").encode(&mut b3);
+            build::flush().encode(&mut b3);
+            wr.write_all(&b3).await.unwrap();
+            for expected in [
+                backend_tag::PARSE_COMPLETE,
+                backend_tag::BIND_COMPLETE,
+                backend_tag::ROW_DESCRIPTION,
+            ] {
+                let f = reader.next().await.unwrap().unwrap();
+                assert_eq!(f.tag, expected);
+            }
+
+            let mut b4 = BytesMut::new();
+            build::execute("p3", 0).encode(&mut b4);
+            build::sync().encode(&mut b4);
+            wr.write_all(&b4).await.unwrap();
+            loop {
+                let f = reader.next().await.unwrap().unwrap();
+                if f.tag == backend_tag::READY_FOR_QUERY {
+                    break;
+                }
+            }
+
+            wr.write_all(&build::terminate().to_bytes()).await.unwrap();
+        }
+    });
+
+    let (_info1, resp1) = ctl.step(1).await;
+    assert_eq!(resp1.summary(), "returns 420");
+
+    let (_info2, resp2) = ctl.step(1).await;
+    assert_eq!(resp2.summary(), "returns 19");
+
+    timeout(STEP, client).await.unwrap().unwrap();
+    timeout(STEP, server).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn supervised_copy_in_and_copy_out_stream_cleanly() {
+    use bytes::{Bytes, BytesMut};
+    use pgloom_wire::error::Peer;
+    use pgloom_wire::frame::{Frame, encode_startup};
+    use pgloom_wire::io::FrameReader;
+    use pgloom_wire::messages::{backend_tag, build, tag};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let (rd, mut wr) = sock.into_split();
+        let mut reader = FrameReader::new(rd, Peer::Client);
+        let _ = reader.next_startup().await.unwrap().unwrap();
+
+        let mut init = BytesMut::new();
+        build::authentication_ok().encode(&mut init);
+        build::backend_key_data(5200, 77).encode(&mut init);
+        build::ready_for_query(TxStatus::Idle).encode(&mut init);
+        wr.write_all(&init).await.unwrap();
+
+        // 1. Eagerly-pipelined Simple COPY IN (pgx style): Query MUST arrive
+        // before CopyData even though both were sent while gated!
+        let q = reader.next().await.unwrap().unwrap();
+        assert_eq!(q.tag, tag::QUERY);
+        wr.write_all(&build::copy_in_response(2).to_bytes())
+            .await
+            .unwrap();
+        let d = reader.next().await.unwrap().unwrap();
+        assert_eq!(d.tag, tag::COPY_DATA);
+        assert_eq!(&d.body[..], b"1\t100\n");
+        let done = reader.next().await.unwrap().unwrap();
+        assert_eq!(done.tag, tag::COPY_DONE);
+        let mut fin = BytesMut::new();
+        build::command_complete("COPY 1").encode(&mut fin);
+        build::ready_for_query(TxStatus::Idle).encode(&mut fin);
+        wr.write_all(&fin).await.unwrap();
+
+        // 2. Extended COPY IN with Flush: Parse + Bind + Execute + Flush,
+        // wait for CopyInResponse, then CopyData + CopyDone + Sync.
+        for expected in [tag::PARSE, tag::BIND, tag::EXECUTE, tag::FLUSH] {
+            let f = reader.next().await.unwrap().unwrap();
+            assert_eq!(f.tag, expected);
+        }
+        let mut resp = BytesMut::new();
+        build::parse_complete().encode(&mut resp);
+        build::bind_complete().encode(&mut resp);
+        build::copy_in_response(2).encode(&mut resp);
+        wr.write_all(&resp).await.unwrap();
+        for expected in [tag::COPY_DATA, tag::COPY_DONE, tag::SYNC] {
+            let f = reader.next().await.unwrap().unwrap();
+            assert_eq!(f.tag, expected);
+        }
+        let mut fin = BytesMut::new();
+        build::command_complete("COPY 1").encode(&mut fin);
+        build::ready_for_query(TxStatus::Idle).encode(&mut fin);
+        wr.write_all(&fin).await.unwrap();
+
+        // 3. Simple COPY OUT: CopyOutResponse ('H') + CopyData + CopyDone
+        // stream immediately, while ReadyForQuery is held for release.
+        let q_out = reader.next().await.unwrap().unwrap();
+        assert_eq!(q_out.tag, tag::QUERY);
+        let mut out = BytesMut::new();
+        build::copy_out_response(2).encode(&mut out);
+        Frame::new(backend_tag::COPY_DATA, Bytes::from_static(b"1\t100\n")).encode(&mut out);
+        Frame::new(backend_tag::COPY_DATA, Bytes::from_static(b"2\t200\n")).encode(&mut out);
+        Frame::new(backend_tag::COPY_DONE, Bytes::new()).encode(&mut out);
+        build::command_complete("COPY 2").encode(&mut out);
+        build::ready_for_query(TxStatus::Idle).encode(&mut out);
+        wr.write_all(&out).await.unwrap();
+
+        let term = reader.next().await.unwrap().unwrap();
+        assert_eq!(term.tag, tag::TERMINATE);
+    });
+
+    let proxy = spawn_proxy(ProxyConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        upstream: upstream_addr.to_string(),
+    })
+    .await
+    .unwrap();
+    let mut ctl = Controller::new(proxy.gate().open_episode());
+
+    let client = tokio::spawn({
+        let addr = proxy.local_addr();
+        async move {
+            let sock = TcpStream::connect(addr).await.unwrap();
+            let (rd, mut wr) = sock.into_split();
+            let mut reader = FrameReader::new(rd, Peer::Server);
+            wr.write_all(&encode_startup(&[("user", "test"), ("database", "test")]))
+                .await
+                .unwrap();
+            loop {
+                let f = reader.next().await.unwrap().unwrap();
+                if f.tag == backend_tag::READY_FOR_QUERY {
+                    break;
+                }
+            }
+
+            // 1. Eagerly send Query + CopyData + CopyDone in one TCP write.
+            let mut eager = BytesMut::new();
+            build::query("COPY wallets FROM STDIN").encode(&mut eager);
+            Frame::new(tag::COPY_DATA, Bytes::from_static(b"1\t100\n")).encode(&mut eager);
+            Frame::new(tag::COPY_DONE, Bytes::new()).encode(&mut eager);
+            wr.write_all(&eager).await.unwrap();
+            loop {
+                let f = reader.next().await.unwrap().unwrap();
+                if f.tag == backend_tag::READY_FOR_QUERY {
+                    break;
+                }
+            }
+
+            // 2. Extended COPY IN with Flush.
+            let mut ext = BytesMut::new();
+            build::parse("", "COPY wallets FROM STDIN", &[]).encode(&mut ext);
+            build::bind("", "", &[]).encode(&mut ext);
+            build::execute("", 0).encode(&mut ext);
+            build::flush().encode(&mut ext);
+            wr.write_all(&ext).await.unwrap();
+            loop {
+                let f = reader.next().await.unwrap().unwrap();
+                if f.tag == backend_tag::COPY_IN_RESPONSE {
+                    break;
+                }
+            }
+            let mut payload = BytesMut::new();
+            Frame::new(tag::COPY_DATA, Bytes::from_static(b"2\t200\n")).encode(&mut payload);
+            Frame::new(tag::COPY_DONE, Bytes::new()).encode(&mut payload);
+            build::sync().encode(&mut payload);
+            wr.write_all(&payload).await.unwrap();
+            loop {
+                let f = reader.next().await.unwrap().unwrap();
+                if f.tag == backend_tag::READY_FOR_QUERY {
+                    break;
+                }
+            }
+
+            // 3. COPY TO STDOUT.
+            wr.write_all(&build::query("COPY wallets TO STDOUT").to_bytes())
+                .await
+                .unwrap();
+            let mut copied = Vec::new();
+            loop {
+                let f = reader.next().await.unwrap().unwrap();
+                if f.tag == backend_tag::COPY_DATA {
+                    copied.extend_from_slice(&f.body);
+                } else if f.tag == backend_tag::READY_FOR_QUERY {
+                    break;
+                }
+            }
+            assert_eq!(copied, b"1\t100\n2\t200\n");
+
+            wr.write_all(&build::terminate().to_bytes()).await.unwrap();
+        }
+    });
+
+    // Ensure eager CopyData was buffered while the turn was held at the gate.
+    let pending1 = ctl.wait_ready(1).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    pending1.permit.grant();
+    let f1 = loop {
+        let ev = ctl.next_event().await;
+        if let Some(f) = ctl.absorb(ev) {
+            break f;
+        }
+    };
+    assert_eq!(f1.response.command_tags, vec!["COPY 1"]);
+    f1.release.release();
+
+    let (_info2, resp2) = ctl.step(1).await;
+    assert_eq!(resp2.command_tags, vec!["COPY 1"]);
+
+    let (_info3, resp3) = ctl.step(1).await;
+    assert_eq!(resp3.command_tags, vec!["COPY 2"]);
+
+    timeout(STEP, client).await.unwrap().unwrap();
+    timeout(STEP, server).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn real_postgres_tokio_postgres_copy_in_and_copy_out_under_gate() {
+    use bytes::Bytes;
+    use futures::{SinkExt, TryStreamExt};
+    use tokio_postgres::NoTls;
+
+    let Ok(db_url) = std::env::var("PGLOOM_TEST_DATABASE_URL") else {
+        return;
+    };
+    let cfg: tokio_postgres::Config = db_url.parse().expect("valid PGLOOM_TEST_DATABASE_URL");
+    let host = match cfg.get_hosts().first() {
+        Some(tokio_postgres::config::Host::Tcp(h)) => h.clone(),
+        _ => return,
+    };
+    let port = cfg.get_ports().first().copied().unwrap_or(5432);
+
+    let proxy = spawn_proxy(ProxyConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        upstream: format!("{host}:{port}"),
+    })
+    .await
+    .unwrap();
+
+    let mut client_cfg = tokio_postgres::Config::new();
+    if let Some(user) = cfg.get_user() {
+        client_cfg.user(user);
+    }
+    if let Some(password) = cfg.get_password() {
+        client_cfg.password(password);
+    }
+    if let Some(dbname) = cfg.get_dbname() {
+        client_cfg.dbname(dbname);
+    }
+    client_cfg.host("127.0.0.1");
+    client_cfg.port(proxy.local_addr().port());
+    let (client, connection) = client_cfg.connect(NoTls).await.unwrap();
+    let conn_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .batch_execute("CREATE TEMP TABLE pgloom_copy_test (id INT, note TEXT)")
+        .await
+        .unwrap();
+
+    let mut ctl = Controller::new(proxy.gate().open_episode());
+
+    let worker = tokio::spawn(async move {
+        let sink = client
+            .copy_in("COPY pgloom_copy_test (id, note) FROM STDIN")
+            .await
+            .unwrap();
+        let mut sink = std::pin::pin!(sink);
+        sink.send(Bytes::from_static(b"1\talpha\n2\tbeta\n"))
+            .await
+            .unwrap();
+        let inserted = sink.finish().await.unwrap();
+        assert_eq!(inserted, 2);
+
+        let stream = client
+            .copy_out("COPY pgloom_copy_test (id, note) TO STDOUT")
+            .await
+            .unwrap();
+        let chunks: Vec<Bytes> = stream.try_collect().await.unwrap();
+        let mut all = Vec::new();
+        for c in chunks {
+            all.extend_from_slice(&c);
+        }
+        assert_eq!(all, b"1\talpha\n2\tbeta\n");
+
+        let rows = client
+            .query("SELECT id, note FROM pgloom_copy_test ORDER BY id", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get::<_, i32>(0), 1);
+        assert_eq!(rows[0].get::<_, String>(1), "alpha");
+    });
+
+    // Step 1: COPY FROM STDIN, Step 2: COPY TO STDOUT, Step 3: SELECT.
+    let (_i1, r1) = ctl.step(1).await;
+    assert_eq!(r1.command_tags, vec!["COPY 2"]);
+    let (_i2, r2) = ctl.step(1).await;
+    assert_eq!(r2.command_tags, vec!["COPY 2"]);
+    let (_i3, r3) = ctl.step(1).await;
+    assert_eq!(r3.summary(), "returns id=1, note=alpha (+1 rows)");
+
+    timeout(STEP, worker).await.unwrap().unwrap();
+    drop(ctl);
+    let _ = timeout(STEP, conn_task).await;
+}
