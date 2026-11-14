@@ -93,11 +93,13 @@ inserts and lock-order deadlocks.
 ## Install
 
 Prebuilt static binaries for Linux (x86_64, arm64) and macOS (Intel, Apple
-silicon) are attached to every [release](https://github.com/Voskan/pgloom/releases):
+silicon) are attached to every [release](https://github.com/Voskan/pgloom/releases).
+Replace the target with `aarch64-unknown-linux-musl`, `x86_64-apple-darwin` or
+`aarch64-apple-darwin` as needed:
 
 ```console
-$ curl -sSfL https://github.com/Voskan/pgloom/releases/latest/download/pgloom-v0.1.0-x86_64-unknown-linux-musl.tar.gz | tar -xz
-$ ./pgloom-v0.1.0-x86_64-unknown-linux-musl/pgloom demo
+$ curl -sSfL https://github.com/Voskan/pgloom/releases/latest/download/pgloom-x86_64-unknown-linux-musl.tar.gz | tar -xz
+$ ./pgloom-x86_64-unknown-linux-musl/pgloom demo
 ```
 
 Or install from [crates.io](https://crates.io/crates/pgloom) with Rust 1.89
