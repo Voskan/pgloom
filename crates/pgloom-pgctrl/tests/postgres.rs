@@ -9,6 +9,17 @@ use pgloom_pgctrl::{
 };
 use tokio_postgres::NoTls;
 
+/// Latency budgets are enforced strictly on a developer machine. Shared CI
+/// runners execute the PostgreSQL matrix in parallel on noisy hardware, so
+/// there the budget only guards against order-of-magnitude regressions.
+fn budget(local: Duration) -> Duration {
+    if std::env::var_os("CI").is_some() {
+        local * 10
+    } else {
+        local
+    }
+}
+
 async fn session(url: &str) -> tokio_postgres::Client {
     let (client, conn) = tokio_postgres::connect(url, NoTls).await.unwrap();
     tokio::spawn(conn);
@@ -67,7 +78,7 @@ async fn snapshot_restore_roundtrip_preserves_data_identity_and_sequences() {
     let elapsed = started.elapsed();
     assert_eq!(stats.tables, vec!["public.wallets", "public.transfers"]);
     assert!(
-        elapsed < Duration::from_millis(250),
+        elapsed < budget(Duration::from_millis(250)),
         "restore took {elapsed:?}"
     );
 

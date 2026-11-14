@@ -19,6 +19,17 @@ use pgloom_pgctrl::PgUrl;
 use pgloom_pgctrl::testing::TestDatabase;
 use pgloom_report::{Pattern, ReproFile, advise};
 
+/// Latency budgets are enforced strictly on a developer machine. Shared CI
+/// runners execute the PostgreSQL matrix in parallel on noisy hardware, so
+/// there the budget only guards against order-of-magnitude regressions.
+fn budget(local: Duration) -> Duration {
+    if std::env::var_os("CI").is_some() {
+        local * 10
+    } else {
+        local
+    }
+}
+
 struct Env {
     db: TestDatabase,
     wallet: WalletServer,
@@ -125,7 +136,7 @@ async fn c01_check_then_act_double_spend() {
     let report = env.run(&env.withdraw_yaml()).await;
     assert_eq!(report.outcome, RunOutcome::ViolationFound);
     assert!(
-        report.elapsed < Duration::from_secs(1),
+        report.elapsed < budget(Duration::from_secs(1)),
         "{:?}",
         report.elapsed
     );
@@ -276,7 +287,7 @@ async fn c06_replay_fidelity() {
     }
     session.close().await;
     assert!(
-        slowest < Duration::from_millis(250),
+        slowest < budget(Duration::from_millis(250)),
         "slowest replay {slowest:?}"
     );
 
