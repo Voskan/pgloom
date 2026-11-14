@@ -18,6 +18,13 @@ else that speaks the PostgreSQL v3 protocol.
 $ pgloom demo
 ```
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Voskan/pgloom/main/assets/demo.svg" alt="pgloom demo finding a PostgreSQL READ COMMITTED double-spend in 53ms and verifying the FOR NO KEY UPDATE fix" width="100%">
+</p>
+
+<details>
+<summary>Plain-text transcript</summary>
+
 ```text
 ✗ RACE CONDITION DETECTED  [demo-wallet-withdraw]
   Explored 3/50 schedules in 66ms (1-preemption trace)
@@ -67,6 +74,8 @@ $ pgloom demo
 
   Concurrency review for ledgers and payment systems: voskan1989@gmail.com
 ```
+
+</details>
 
 The demo then patches the handler with `FOR NO KEY UPDATE`, re-explores every
 interleaving, parking the second transaction on the row lock instead of
