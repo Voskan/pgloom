@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tracing::debug;
 
 use crate::control::PgControl;
-use crate::error::{PgCtrlError, PgCtrlResult};
+use crate::error::{PgCtrlError, PgCtrlResult, RowExt};
 
 pub const SNAPSHOT_SCHEMA: &str = "_pgloom_snap";
 
@@ -260,12 +260,13 @@ impl Snapshot {
 
         let mut tables: BTreeMap<i64, TableSnapshot> = BTreeMap::new();
         for row in rows {
-            let schema: String = row.get(1);
-            let name: String = row.get(2);
+            const CONTEXT: &str = "listing user tables";
+            let schema: String = row.col(1, CONTEXT)?;
+            let name: String = row.col(2, CONTEXT)?;
             if excluded(&schema, &name) {
                 continue;
             }
-            let oid: i64 = row.get(0);
+            let oid: i64 = row.col(0, CONTEXT)?;
             tables.insert(
                 oid,
                 TableSnapshot {
@@ -273,7 +274,7 @@ impl Snapshot {
                     schema,
                     name,
                     columns: Vec::new(),
-                    has_user_triggers: row.get(3),
+                    has_user_triggers: row.col(3, CONTEXT)?,
                     sequences: Vec::new(),
                 },
             );
@@ -291,9 +292,9 @@ impl Snapshot {
             .await
             .map_err(PgCtrlError::query("listing table columns"))?;
         for row in cols {
-            let oid: i64 = row.get(0);
+            let oid: i64 = row.col(0, "listing table columns")?;
             if let Some(t) = tables.get_mut(&oid) {
-                t.columns.push(row.get(1));
+                t.columns.push(row.col(1, "listing table columns")?);
             }
         }
 
@@ -313,8 +314,8 @@ impl Snapshot {
             .await
             .map_err(PgCtrlError::query("listing owned sequences"))?;
         for row in seqs {
-            let oid: i64 = row.get(0);
-            let name: String = row.get(1);
+            let oid: i64 = row.col(0, "listing owned sequences")?;
+            let name: String = row.col(1, "listing owned sequences")?;
             let state = client
                 .query_one(&format!("SELECT last_value, is_called FROM {name}"), &[])
                 .await
@@ -322,8 +323,8 @@ impl Snapshot {
             if let Some(t) = tables.get_mut(&oid) {
                 t.sequences.push(SequenceState {
                     name,
-                    last_value: state.get(0),
-                    is_called: state.get(1),
+                    last_value: state.col(0, "reading sequence state")?,
+                    is_called: state.col(1, "reading sequence state")?,
                 });
             }
         }
@@ -336,7 +337,15 @@ impl Snapshot {
             )
             .await
             .map_err(PgCtrlError::query("listing foreign keys"))?;
-        let fk_pairs: Vec<(i64, i64)> = fks.iter().map(|r| (r.get(0), r.get(1))).collect();
+        let fk_pairs: Vec<(i64, i64)> = fks
+            .iter()
+            .map(|r| {
+                Ok((
+                    r.col(0, "listing foreign keys")?,
+                    r.col(1, "listing foreign keys")?,
+                ))
+            })
+            .collect::<PgCtrlResult<_>>()?;
 
         let snapshot = Snapshot::from_parts(tables.into_values().collect(), &fk_pairs);
         ctl.batch(&snapshot.capture_sql(), "creating snapshot tables")

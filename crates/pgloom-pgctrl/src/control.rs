@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage, Statement};
 use tracing::{debug, warn};
 
-use crate::error::{PgCtrlError, PgCtrlResult};
+use crate::error::{PgCtrlError, PgCtrlResult, RowExt};
 use crate::url::PgUrl;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -118,19 +118,25 @@ impl PgControl {
             .simple_query(sql)
             .await
             .map_err(PgCtrlError::query(context))?;
-        Ok(messages
+        messages
             .into_iter()
             .filter_map(|m| match m {
                 SimpleQueryMessage::Row(row) => Some(
                     row.columns()
                         .iter()
                         .enumerate()
-                        .map(|(i, c)| (c.name().to_owned(), row.get(i).map(str::to_owned)))
-                        .collect(),
+                        .map(|(i, c)| {
+                            let value = row
+                                .try_get(i)
+                                .map_err(PgCtrlError::query(context))?
+                                .map(str::to_owned);
+                            Ok((c.name().to_owned(), value))
+                        })
+                        .collect::<PgCtrlResult<Vec<_>>>(),
                 ),
                 _ => None,
             })
-            .collect())
+            .collect()
     }
 
     pub async fn server_version(&self) -> PgCtrlResult<String> {
@@ -139,7 +145,7 @@ impl PgControl {
             .query_one("SHOW server_version", &[])
             .await
             .map_err(PgCtrlError::query("reading server_version"))?;
-        Ok(row.get(0))
+        row.col(0, "reading server_version")
     }
 
     /// `pg_blocking_pids()` for every tracked backend that is waiting.
@@ -154,16 +160,17 @@ impl PgControl {
             .await
             .map_err(PgCtrlError::query("inspecting lock waits"))?;
         let mut out = BTreeMap::new();
+        const CONTEXT: &str = "inspecting lock waits";
         for row in rows {
-            let pid: i32 = row.get(0);
-            let mut blocked_by: Vec<i32> = row.get(2);
+            let pid: i32 = row.col(0, CONTEXT)?;
+            let mut blocked_by: Vec<i32> = row.col(2, CONTEXT)?;
             blocked_by.sort_unstable();
             blocked_by.dedup();
             out.insert(
                 pid,
                 BlockingInfo {
                     pid,
-                    wait_event_type: row.get(1),
+                    wait_event_type: row.col(1, CONTEXT)?,
                     blocked_by,
                 },
             );
@@ -190,7 +197,9 @@ impl PgControl {
             )
             .await
             .map_err(PgCtrlError::query("listing open transactions"))?;
-        Ok(rows.iter().map(|r| r.get(0)).collect())
+        rows.iter()
+            .map(|r| r.col(0, "listing open transactions"))
+            .collect()
     }
 
     /// `pg_cancel_backend(pid)`: aborts the backend's current statement.
@@ -209,7 +218,7 @@ impl PgControl {
         }
         let sql = format!("SELECT {function}($1)");
         match self.client.query_one(&sql, &[&pid]).await {
-            Ok(row) => Ok(row.get(0)),
+            Ok(row) => row.col(0, function),
             Err(err) => {
                 warn!(%err, pid, function, "backend signal failed");
                 Err(PgCtrlError::Query {
@@ -250,7 +259,7 @@ impl PgControl {
                 )
                 .await
                 .map_err(PgCtrlError::query("waiting for terminated backends"))?;
-            let alive: i64 = row.get(0);
+            let alive: i64 = row.col(0, "waiting for terminated backends")?;
             if alive == 0 {
                 return Ok(());
             }

@@ -3,7 +3,7 @@
 //! by column defaults, triggers and rules, and user-defined volatile functions.
 
 use crate::control::PgControl;
-use crate::error::{PgCtrlError, PgCtrlResult};
+use crate::error::{PgCtrlError, PgCtrlResult, RowExt};
 
 /// Kind of a relation, from `pg_class.relkind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,17 +89,20 @@ impl PgControl {
             )
             .await
             .map_err(PgCtrlError::query("reading relations"))?;
+        const RELATIONS: &str = "reading relations";
         let relations = rows
             .iter()
-            .map(|r| CatalogRelation {
-                oid: r.get(0),
-                schema: r.get(1),
-                name: r.get(2),
-                kind: RelationKind::from_relkind(r.get::<_, &str>(3)),
-                side_effects: r.get(4),
-                row_security: r.get(5),
+            .map(|r| {
+                Ok(CatalogRelation {
+                    oid: r.col(0, RELATIONS)?,
+                    schema: r.col(1, RELATIONS)?,
+                    name: r.col(2, RELATIONS)?,
+                    kind: RelationKind::from_relkind(r.col::<&str>(3, RELATIONS)?),
+                    side_effects: r.col(4, RELATIONS)?,
+                    row_security: r.col(5, RELATIONS)?,
+                })
             })
-            .collect();
+            .collect::<PgCtrlResult<_>>()?;
 
         let rows = client
             .query(
@@ -121,18 +124,21 @@ impl PgControl {
             )
             .await
             .map_err(PgCtrlError::query("reading relation dependencies"))?;
+        const LINKS: &str = "reading relation dependencies";
         let links = rows
             .iter()
-            .map(|r| CatalogLink {
-                kind: match r.get::<_, i32>(0) {
-                    0 => LinkKind::ForeignKey,
-                    1 => LinkKind::Inherits,
-                    _ => LinkKind::Sequence,
-                },
-                from: r.get(1),
-                to: r.get(2),
+            .map(|r| {
+                Ok(CatalogLink {
+                    kind: match r.col::<i32>(0, LINKS)? {
+                        0 => LinkKind::ForeignKey,
+                        1 => LinkKind::Inherits,
+                        _ => LinkKind::Sequence,
+                    },
+                    from: r.col(1, LINKS)?,
+                    to: r.col(2, LINKS)?,
+                })
             })
-            .collect();
+            .collect::<PgCtrlResult<_>>()?;
 
         let rows = client
             .query(
@@ -145,7 +151,10 @@ impl PgControl {
             )
             .await
             .map_err(PgCtrlError::query("reading user functions"))?;
-        let volatile_functions = rows.iter().map(|r| r.get(0)).collect();
+        let volatile_functions = rows
+            .iter()
+            .map(|r| r.col(0, "reading user functions"))
+            .collect::<PgCtrlResult<_>>()?;
 
         Ok(SchemaCatalog {
             relations,

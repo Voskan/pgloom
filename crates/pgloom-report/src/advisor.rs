@@ -131,6 +131,11 @@ pub fn advise(record: &EpisodeRecord, violations: &[Violation], names: &[String]
     let table = &first.table;
 
     if first_keyword(first.write) == "INSERT" {
+        let (insert_body, returning) = split_returning(&write);
+        let on_conflict = match returning {
+            Some(ret) => format!("{insert_body} ON CONFLICT DO NOTHING {ret};"),
+            None => format!("{insert_body} ON CONFLICT DO NOTHING;"),
+        };
         out.push(Advice {
             pattern: Pattern::PhantomInsert,
             explanation: vec![
@@ -146,10 +151,7 @@ pub fn advise(record: &EpisodeRecord, violations: &[Violation], names: &[String]
                         format!(
                             "CREATE UNIQUE INDEX CONCURRENTLY ON {table} (<natural key columns>);"
                         ),
-                        format!(
-                            "{} ON CONFLICT DO NOTHING;",
-                            one_line(first.write).trim_end_matches(';')
-                        ),
+                        on_conflict,
                         "-- and treat rows_affected == 0 as \"already exists\".".into(),
                     ],
                 },
@@ -204,7 +206,10 @@ pub fn advise(record: &EpisodeRecord, violations: &[Violation], names: &[String]
                 title: "Fix Option B (Atomic Guarded Update):".into(),
                 sql: vec![
                     guarded.unwrap_or_else(|| {
-                        format!("{write} AND <the condition you checked in application code>;")
+                        append_where_guard(
+                            &write,
+                            "<the condition you checked in application code>",
+                        )
                     }),
                     "-- and verify rows_affected == 1 before reporting success.".into(),
                 ],
@@ -243,22 +248,126 @@ fn lock_order(
     }
 }
 
-/// `SET` clause and the remainder of an `UPDATE`, split at the top-level
-/// `WHERE` (case-insensitive, ignoring string literals is unnecessary here
-/// because only the shape is inspected).
-fn split_update(sql: &str) -> Option<(String, String, Option<String>)> {
+/// Finds the first top-level (outside parentheses and single-quoted literals)
+/// ASCII case-insensitive occurrence of `needle`.
+fn find_top_level(s: &str, needle: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let nlen = needle.len();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' => in_str = true,
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ if depth == 0
+                && i + nlen <= bytes.len()
+                && s.is_char_boundary(i)
+                && s.is_char_boundary(i + nlen)
+                && s[i..i + nlen].eq_ignore_ascii_case(needle) =>
+            {
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Splits off a trailing top-level `RETURNING ...` clause so `WHERE` / `ON
+/// CONFLICT` additions are placed before `RETURNING`.
+fn split_returning(sql: &str) -> (&str, Option<&str>) {
+    match find_top_level(sql, " RETURNING ") {
+        Some(pos) => (sql[..pos].trim_end(), Some(sql[pos + 1..].trim())),
+        None => (sql, None),
+    }
+}
+
+struct SplitUpdate {
+    head: String,
+    set_clause: String,
+    from_clause: Option<String>,
+    cond: Option<String>,
+    returning: Option<String>,
+}
+
+impl SplitUpdate {
+    fn render_with_guard(&self, guard: &str) -> String {
+        let from = self
+            .from_clause
+            .as_deref()
+            .map_or_else(String::new, |f| format!(" {f}"));
+        let where_body = match &self.cond {
+            Some(c) => format!("{c} AND {guard}"),
+            None => guard.to_owned(),
+        };
+        let ret = self
+            .returning
+            .as_deref()
+            .map_or_else(String::new, |r| format!(" {r}"));
+        format!(
+            "{} SET {}{from} WHERE {where_body}{ret};",
+            self.head, self.set_clause
+        )
+    }
+}
+
+/// Parses an `UPDATE` into `head`, `SET`, optional `FROM`, optional `WHERE`,
+/// and optional `RETURNING` clauses at top level.
+fn split_update(sql: &str) -> Option<SplitUpdate> {
     let flat = one_line(sql);
     let flat = flat.trim_end_matches(';');
-    let upper = flat.to_ascii_uppercase();
-    if !upper.starts_with("UPDATE ") {
+    if flat.len() < 7 || !flat[..7].eq_ignore_ascii_case("UPDATE ") {
         return None;
     }
-    let set = upper.find(" SET ")?;
-    let (head, rest) = (flat[..set].to_owned(), &flat[set + 5..]);
-    let rest_upper = &upper[set + 5..];
-    match rest_upper.find(" WHERE ") {
-        Some(w) => Some((head, rest[..w].to_owned(), Some(rest[w + 7..].to_owned()))),
-        None => Some((head, rest.to_owned(), None)),
+    let (without_ret, returning) = split_returning(flat);
+    let set_pos = find_top_level(without_ret, " SET ")?;
+    let head = without_ret[..set_pos].to_owned();
+    let after_set = &without_ret[set_pos + 5..];
+    let (before_where, cond) = match find_top_level(after_set, " WHERE ") {
+        Some(w) => (&after_set[..w], Some(after_set[w + 7..].trim().to_owned())),
+        None => (after_set, None),
+    };
+    let (set_clause, from_clause) = match find_top_level(before_where, " FROM ") {
+        Some(f) => (
+            before_where[..f].trim().to_owned(),
+            Some(before_where[f + 1..].trim().to_owned()),
+        ),
+        None => (before_where.trim().to_owned(), None),
+    };
+    Some(SplitUpdate {
+        head,
+        set_clause,
+        from_clause,
+        cond,
+        returning: returning.map(str::to_owned),
+    })
+}
+
+fn append_where_guard(sql: &str, guard: &str) -> String {
+    match split_update(sql) {
+        Some(u) => u.render_with_guard(guard),
+        None => {
+            let (body, ret) = split_returning(sql.trim_end_matches(';'));
+            match ret {
+                Some(r) => format!("{body} AND {guard} {r};"),
+                None => format!("{body} AND {guard};"),
+            }
+        }
     }
 }
 
@@ -272,10 +381,10 @@ fn assignments(set: &str) -> Vec<(String, String)> {
 /// Every assignment writes a literal or a bind parameter rather than an
 /// expression over the current row.
 fn is_absolute_assignment(sql: &str) -> bool {
-    let Some((_, set, _)) = split_update(sql) else {
+    let Some(u) = split_update(sql) else {
         return false;
     };
-    let a = assignments(&set);
+    let a = assignments(&u.set_clause);
     !a.is_empty()
         && a.iter().all(|(_, e)| {
             e.strip_prefix('$')
@@ -284,18 +393,15 @@ fn is_absolute_assignment(sql: &str) -> bool {
         })
 }
 
-/// For `SET c = c - x WHERE p`, proposes `... WHERE p AND c >= x`.
+/// For `SET c = c - x WHERE p [RETURNING ...]`, proposes
+/// `... WHERE p AND c >= x [RETURNING ...]`.
 fn guarded_update(sql: &str) -> Option<String> {
-    let (head, set, cond) = split_update(sql)?;
-    let (col, delta) = assignments(&set).into_iter().find_map(|(c, e)| {
+    let u = split_update(sql)?;
+    let (col, delta) = assignments(&u.set_clause).into_iter().find_map(|(c, e)| {
         let (lhs, rhs) = e.split_once('-')?;
         (lhs.trim() == c).then(|| (c.clone(), rhs.trim().to_owned()))
     })?;
-    let cond = match cond {
-        Some(c) => format!("{c} AND {col} >= {delta}"),
-        None => format!("{col} >= {delta}"),
-    };
-    Some(format!("{head} SET {set} WHERE {cond};"))
+    Some(u.render_with_guard(&format!("{col} >= {delta}")))
 }
 
 #[cfg(test)]
@@ -405,5 +511,45 @@ mod tests {
         assert_eq!(a.pattern, Pattern::LockOrderInversion);
         assert!(a.explanation[0].contains("req_a → req_b → req_a"));
         assert!(a.fixes[0].sql[0].contains("ORDER BY id FOR NO KEY UPDATE"));
+    }
+
+    #[test]
+    fn returning_clauses_stay_at_the_end_of_proposed_sql() {
+        let r = record(&[
+            (0, "SELECT balance FROM wallets WHERE id = $1"),
+            (
+                0,
+                "UPDATE wallets SET balance = balance - $1 WHERE id = $2 RETURNING balance",
+            ),
+        ]);
+        let a = &advise(&r, &[], &names())[0];
+        assert_eq!(
+            a.fixes[1].sql[0],
+            "UPDATE wallets SET balance = balance - $1 WHERE id = $2 AND balance >= $1 RETURNING balance;"
+        );
+
+        let lost = record(&[
+            (0, "SELECT balance FROM wallets WHERE id = $1"),
+            (
+                0,
+                "UPDATE wallets SET balance = $1 WHERE id = $2 RETURNING balance",
+            ),
+        ]);
+        let a = &advise(&lost, &[], &names())[0];
+        assert_eq!(a.pattern, Pattern::LostUpdate);
+        assert_eq!(
+            a.fixes[1].sql[0],
+            "UPDATE wallets SET balance = $1 WHERE id = $2 AND <the condition you checked in application code> RETURNING balance;"
+        );
+
+        let ins = record(&[
+            (0, "SELECT count(*) FROM bookings WHERE slot = 7"),
+            (0, "INSERT INTO bookings (slot) VALUES (7) RETURNING id"),
+        ]);
+        let a = &advise(&ins, &[], &names())[0];
+        assert_eq!(
+            a.fixes[0].sql[1],
+            "INSERT INTO bookings (slot) VALUES (7) ON CONFLICT DO NOTHING RETURNING id;"
+        );
     }
 }

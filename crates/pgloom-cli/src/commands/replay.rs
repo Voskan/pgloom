@@ -93,14 +93,19 @@ pub async fn replay(args: ReplayArgs, printer: Printer) -> Result<u8, CliError> 
 }
 
 /// The scenario file a repro was recorded from. Its path is relative to the
-/// directory `pgloom run` ran in, which need not be the current one: it is
-/// looked up as recorded, then next to the repro file (`run` writes the repro
-/// to its own current directory by default).
+/// directory `pgloom run` ran in, which need not be the current one: check
+/// beside the repro file first (where `run` writes `.pgloom-repro.json` by
+/// default) so an unrelated `./pgloom.yaml` in the current directory does not
+/// shadow an example's scenario, then fall back to the recorded path as-is.
 fn locate_scenario(recorded: &str, repro: &Path) -> Option<PathBuf> {
     let recorded = Path::new(recorded);
-    let beside_repro = repro.parent().map(|dir| dir.join(recorded));
-    std::iter::once(recorded.to_owned())
-        .chain(beside_repro)
+    let beside_repro = repro
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(recorded));
+    beside_repro
+        .into_iter()
+        .chain(std::iter::once(recorded.to_owned()))
         .find(|candidate| candidate.is_file())
 }
 
@@ -113,7 +118,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let example = root.path().join("examples/wallet");
         std::fs::create_dir_all(&example).unwrap();
-        std::fs::write(example.join("pgloom.yaml"), "").unwrap();
+        std::fs::write(example.join("pgloom.yaml"), "name: example\n").unwrap();
+        // An unrelated scenario in a parent directory does not shadow the
+        // scenario next to the repro file.
+        std::fs::write(root.path().join("pgloom.yaml"), "name: root\n").unwrap();
         let repro = example.join(".pgloom-repro.json");
 
         // Recorded inside the example directory, replayed from elsewhere.
@@ -121,10 +129,12 @@ mod tests {
             locate_scenario("pgloom.yaml", &repro),
             Some(example.join("pgloom.yaml"))
         );
-        // Recorded with a path that still resolves as written.
+        // Recorded with a path that still resolves as written when `--repro-out`
+        // placed the repro file elsewhere.
+        let other_repro = root.path().join("artifacts/repro.json");
         let absolute = example.join("pgloom.yaml");
         assert_eq!(
-            locate_scenario(absolute.to_str().unwrap(), Path::new(".pgloom-repro.json")),
+            locate_scenario(absolute.to_str().unwrap(), &other_repro),
             Some(absolute)
         );
         assert_eq!(locate_scenario("missing.yaml", &repro), None);

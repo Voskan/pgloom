@@ -109,7 +109,7 @@ or newer:
 $ cargo install pgloom --locked
 ```
 
-PostgreSQL 12 or newer is required. The role PgLoom connects as needs
+PostgreSQL 12 or newer is required (CI runs every release against 12 through 17). The role PgLoom connects as needs
 `CREATE` on the database (for its snapshot schema) and must be able to see and
 signal the service's backends: the same role, a superuser, or membership in
 `pg_read_all_stats` and `pg_signal_backend`. `pgloom doctor` checks all of it.
