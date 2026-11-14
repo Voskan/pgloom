@@ -6,8 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-14
+
 ### Fixed
 
+- Log lines on stderr (warnings such as an unhealthy `ready_http`) honor
+  `--color` and are plain text when stderr is not a terminal, instead of
+  carrying ANSI escapes into CI logs and redirected files.
 - Pipelined `Parse` + `Describe` batches (multiple `Describe(Statement)` and
   `Describe(Portal)` messages in a single `Flush` or `Sync` pipeline) preserve
   each object's column layout in wire order instead of overwriting earlier
@@ -116,6 +121,7 @@ First public release.
 - Commands `run`, `replay`, `demo`, `init` and `doctor`; text and JSON
   reports; `.pgloom-repro.json` files.
 
-[Unreleased]: https://github.com/Voskan/pgloom/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Voskan/pgloom/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/Voskan/pgloom/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Voskan/pgloom/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Voskan/pgloom/releases/tag/v0.1.0

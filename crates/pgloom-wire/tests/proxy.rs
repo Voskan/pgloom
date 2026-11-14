@@ -830,7 +830,7 @@ async fn real_postgres_tokio_postgres_copy_in_and_copy_out_under_gate() {
         assert_eq!(rows[0].get::<_, String>(1), "alpha");
     });
 
-    // Step 1: COPY FROM STDIN, Step 2: COPY TO STDOUT, Step 3: SELECT.
+    // Three gated turns: COPY FROM STDIN, COPY TO STDOUT, then the SELECT.
     let (_i1, r1) = ctl.step(1).await;
     assert_eq!(r1.command_tags, vec!["COPY 2"]);
     let (_i2, r2) = ctl.step(1).await;
