@@ -16,7 +16,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -48,7 +48,7 @@ jobs:
     env:
       PGLOOM_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --workspace --all-features
@@ -59,8 +59,8 @@ jobs:
     name: msrv (Rust 1.89)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.120
       - uses: Swatinem/rust-cache@v2
       # PostgreSQL-backed tests are skipped without PGLOOM_TEST_DATABASE_URL;
       # the point is that the declared rust-version builds and runs.
@@ -83,10 +83,10 @@ jobs:
     env:
       PGLOOM_UPSTREAM_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache-dependency-path: examples/go-wallet/go.sum
@@ -126,10 +126,10 @@ jobs:
     env:
       PGLOOM_UPSTREAM_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip

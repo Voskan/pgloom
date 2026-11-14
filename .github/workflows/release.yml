@@ -34,7 +34,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ env.TAG }}
       - name: The tag matches the crate version
@@ -71,7 +71,7 @@ jobs:
       - name: Smoke test
         if: matrix.target != 'x86_64-apple-darwin'
         run: target/${{ matrix.target }}/release/pgloom --version
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pgloom-${{ matrix.target }}
           path: pgloom-*.tar.gz*
@@ -83,7 +83,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: pgloom-*
           merge-multiple: true
