@@ -20,5 +20,7 @@ updates:
       interval: monthly
   - package-ecosystem: pip
     directory: /examples/python-wallet
+    # The ranges already admit new releases; only widen them when needed.
+    versioning-strategy: increase-if-necessary
     schedule:
       interval: monthly

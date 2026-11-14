@@ -17,6 +17,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockingInfo {
     pub pid: i32,
+    /// Informational only. A backend joins the lock queue, and so shows up
+    /// in `blocked_by`, slightly before it reports the `Lock` wait event.
     pub wait_event_type: Option<String>,
     pub blocked_by: Vec<i32>,
 }

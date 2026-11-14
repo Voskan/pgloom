@@ -175,7 +175,11 @@ async fn blocking_pids_cancel_and_terminate() {
     let mut info = None;
     for _ in 0..200 {
         let map = ctl.blocking_pids(&[holder_pid, waiter_pid]).await.unwrap();
-        if let Some(w) = map.get(&waiter_pid).filter(|w| !w.blocked_by.is_empty()) {
+        // The waiter enters the lock queue before it reports the wait event.
+        if let Some(w) = map
+            .get(&waiter_pid)
+            .filter(|w| !w.blocked_by.is_empty() && w.wait_event_type.as_deref() == Some("Lock"))
+        {
             info = Some(w.clone());
             break;
         }

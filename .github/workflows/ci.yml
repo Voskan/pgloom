@@ -60,7 +60,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89
+      # The toolchain is an input, not the action ref: Dependabot treats a
+      # version-named ref as an action release and would "upgrade" it.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89"
       - uses: Swatinem/rust-cache@v2
       # PostgreSQL-backed tests are skipped without PGLOOM_TEST_DATABASE_URL;
       # the point is that the declared rust-version builds and runs.
