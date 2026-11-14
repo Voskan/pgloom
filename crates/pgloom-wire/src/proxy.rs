@@ -250,6 +250,9 @@ struct Expectation {
     gated: Option<EventTx>,
     described_statement: Option<String>,
     result_shape: Option<ResultShape>,
+    /// A `Describe`-then-`Flush` round trip: complete once the statement's
+    /// row layout (or an error) arrives, since no `ReadyForQuery` follows.
+    describe_only: bool,
 }
 
 async fn run_session(
@@ -479,7 +482,11 @@ async fn forward(
     seq: u64,
     gated: Option<EventTx>,
 ) -> WireResult<()> {
-    if turn.terminator.expects_ready_for_query() {
+    // Drivers such as asyncpg and JDBC prepare with Parse/Describe/Flush and
+    // only later Bind the statement; its row layout must be learned here or
+    // those rows cannot be decoded.
+    let describe_only = turn.terminator == Terminator::Flush && turn.described_statement.is_some();
+    if turn.terminator.expects_ready_for_query() || describe_only {
         // Must be registered before the bytes leave, so the response can never
         // overtake its expectation.
         let _ = expect_tx.send(Expectation {
@@ -487,6 +494,7 @@ async fn forward(
             gated,
             described_statement: turn.described_statement.clone(),
             result_shape: turn.result_shape.clone(),
+            describe_only,
         });
     }
     swr.write_all(&turn.raw).await?;
@@ -540,7 +548,13 @@ async fn relay_server(
                             .get(&shape.statement)
                             .map(|cols| shaped_columns(cols, &shape.formats))
                     })
-                    .map_or_else(ResponseCollector::new, ResponseCollector::with_columns);
+                    .map_or_else(ResponseCollector::new, ResponseCollector::with_columns)
+                    .with_bind_formats(
+                        expectation
+                            .result_shape
+                            .as_ref()
+                            .map(|shape| shape.formats.clone()),
+                    );
                 InFlight {
                     expectation,
                     collector,
@@ -557,7 +571,14 @@ async fn relay_server(
             continue;
         };
 
-        let is_ready = cur.collector.observe(&frame)?;
+        let is_ready = cur.collector.observe(&frame)?
+            || (cur.expectation.describe_only
+                && matches!(
+                    frame.tag,
+                    backend_tag::ROW_DESCRIPTION
+                        | backend_tag::NO_DATA
+                        | backend_tag::ERROR_RESPONSE
+                ));
         let supervised = cur.expectation.gated.is_some();
         if supervised && !cur.streaming {
             frame.encode(&mut cur.held);

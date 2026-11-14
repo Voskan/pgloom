@@ -4,8 +4,6 @@ use clap::Parser;
 use pgloom_cli::cli::Cli;
 use tracing_subscriber::EnvFilter;
 
-const EXIT_INTERRUPTED: u8 = 130;
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let default = match cli.verbose {
@@ -34,10 +32,24 @@ fn main() -> ExitCode {
     let code = runtime.block_on(async {
         tokio::select! {
             code = pgloom_cli::execute(cli) => code,
-            _ = tokio::signal::ctrl_c() => EXIT_INTERRUPTED,
+            () = interrupts() => pgloom_cli::error::EXIT_INTERRUPTED,
         }
     });
     // Do not wait for detached tasks (proxy sessions, HTTP keep-alives).
     runtime.shutdown_timeout(std::time::Duration::from_millis(200));
     ExitCode::from(code)
+}
+
+/// Resolves on the second Ctrl+C; the first one asks the command to wind
+/// down cleanly.
+#[allow(clippy::print_stderr)]
+async fn interrupts() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        return std::future::pending().await;
+    }
+    pgloom_cli::interrupt::request();
+    eprintln!(
+        "\ninterrupted: finishing the current schedule and restoring the database (Ctrl+C again to abort)"
+    );
+    let _ = tokio::signal::ctrl_c().await;
 }

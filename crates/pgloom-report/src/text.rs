@@ -27,6 +27,9 @@ pub struct ReportContext {
     pub timeline: TimelineOptions,
     /// Printed once below a report that found a violation.
     pub footer: Option<String>,
+    /// `--quiet`: verdict, violated invariants and the replay command only,
+    /// without the timeline and the Fix Advisor.
+    pub compact: bool,
 }
 
 impl ReportContext {
@@ -41,6 +44,7 @@ impl ReportContext {
             color: false,
             timeline: TimelineOptions::default(),
             footer: None,
+            compact: false,
         }
     }
 
@@ -74,6 +78,20 @@ fn plural(n: impl Into<u64>, one: &str, many: &str) -> String {
 pub fn render_run(ctx: &ReportContext, report: &RunReport) -> String {
     let mut out = String::new();
     match report.outcome {
+        RunOutcome::Pass if report.interrupted => {
+            let _ = writeln!(
+                out,
+                "{}  [{}]",
+                ctx.paint("■ INTERRUPTED", Style::Bold),
+                ctx.scenario
+            );
+            let _ = writeln!(
+                out,
+                "  Explored {} in {} before the interruption; no anomalies so far, exploration incomplete.",
+                plural(report.stats.schedules as u64, "schedule", "schedules"),
+                format_duration(report.elapsed),
+            );
+        }
         RunOutcome::Pass => {
             let _ = writeln!(
                 out,
@@ -118,6 +136,13 @@ pub fn render_run(ctx: &ReportContext, report: &RunReport) -> String {
                     format_duration(report.elapsed)
                 );
                 out.push_str(&render_failure(ctx, failure, &explored));
+            }
+            if report.interrupted {
+                let _ = writeln!(
+                    out,
+                    "\n  Interrupted after {}; other interleavings were not explored.",
+                    plural(report.stats.schedules as u64, "schedule", "schedules")
+                );
             }
             if let Some(footer) = &ctx.footer {
                 let _ = writeln!(out, "\n  {}", ctx.paint(footer, Style::Dim));
@@ -193,6 +218,11 @@ pub fn render_episode(
             out.push_str(&render_violation(ctx, v));
         }
         out.push('\n');
+    }
+    if ctx.compact {
+        let mut out = out.trim_end().to_owned();
+        out.push('\n');
+        return out;
     }
     let _ = writeln!(
         out,

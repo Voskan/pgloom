@@ -28,6 +28,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use pgloom_wire::{
@@ -163,10 +164,42 @@ impl Default for CoordinatorConfig {
 }
 
 /// Verdict of a run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RunOutcome {
+    #[default]
     Pass,
     ViolationFound,
+}
+
+/// Live view of a run, shared between the coordinator and its caller: the
+/// caller may request a stop and read progress while schedules execute.
+#[derive(Debug, Default)]
+pub struct RunControl {
+    stop: AtomicBool,
+    schedules: AtomicUsize,
+    failures: AtomicUsize,
+}
+
+impl RunControl {
+    /// Finishes the schedule in progress (including the database reset) and
+    /// returns instead of starting another one.
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    pub fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// Schedules executed so far in the current run.
+    pub fn schedules(&self) -> usize {
+        self.schedules.load(Ordering::Relaxed)
+    }
+
+    /// Distinct failures found so far in the current run.
+    pub fn failures(&self) -> usize {
+        self.failures.load(Ordering::Relaxed)
+    }
 }
 
 /// A failing schedule with everything needed to report and replay it.
@@ -183,13 +216,18 @@ pub struct Failure {
 }
 
 /// Result of [`Coordinator::run`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RunReport {
     pub outcome: RunOutcome,
     pub stats: ExplorationStats,
     pub elapsed: Duration,
     /// Total lock parks across all schedules.
     pub parks: usize,
+    /// Database turns the workers sent through the proxy, across all
+    /// schedules. Zero means the service never used the proxy.
+    pub turns: usize,
+    /// The run stopped early on [`RunControl::request_stop`].
+    pub interrupted: bool,
     pub failures: Vec<Failure>,
 }
 
@@ -213,6 +251,7 @@ pub struct Coordinator<W, D, O> {
     db: D,
     oracle: O,
     config: CoordinatorConfig,
+    control: Arc<RunControl>,
 }
 
 impl<W: Workload, D: DbControl, O: EpisodeOracle> Coordinator<W, D, O> {
@@ -223,11 +262,17 @@ impl<W: Workload, D: DbControl, O: EpisodeOracle> Coordinator<W, D, O> {
             db,
             oracle,
             config,
+            control: Arc::default(),
         }
     }
 
     pub fn config(&self) -> &CoordinatorConfig {
         &self.config
+    }
+
+    /// Stop requests and progress of [`Coordinator::run`].
+    pub fn control(&self) -> Arc<RunControl> {
+        self.control.clone()
     }
 
     pub fn workload(&self) -> &W {
@@ -243,9 +288,22 @@ impl<W: Workload, D: DbControl, O: EpisodeOracle> Coordinator<W, D, O> {
         // shrinking could change them.
         let mut signatures: Vec<BTreeSet<String>> = Vec::new();
         let mut parks = 0;
-        while explorer.next_schedule() {
+        let mut turns = 0;
+        let mut interrupted = false;
+        self.control.schedules.store(0, Ordering::Relaxed);
+        self.control.failures.store(0, Ordering::Relaxed);
+        loop {
+            if self.control.stop_requested() {
+                interrupted = true;
+                break;
+            }
+            if !explorer.next_schedule() {
+                break;
+            }
             let episode = self.run_episode(&mut explorer).await?;
+            self.control.schedules.fetch_add(1, Ordering::Relaxed);
             parks += episode.parks;
+            turns += episode.record.turns();
             if episode.pruned || episode.violations.is_empty() {
                 continue;
             }
@@ -256,6 +314,7 @@ impl<W: Workload, D: DbControl, O: EpisodeOracle> Coordinator<W, D, O> {
                 continue;
             }
             signatures.push(signature);
+            self.control.failures.fetch_add(1, Ordering::Relaxed);
             let mut failure = Failure {
                 schedule: episode.schedule,
                 record: episode.record,
@@ -280,6 +339,8 @@ impl<W: Workload, D: DbControl, O: EpisodeOracle> Coordinator<W, D, O> {
             stats: explorer.stats(),
             elapsed: started.elapsed(),
             parks,
+            turns,
+            interrupted,
             failures,
         })
     }

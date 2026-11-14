@@ -213,6 +213,9 @@ async fn act(
         &report_context(config, &workers, printer),
         &report,
     ));
+    if report.interrupted {
+        return Err(CliError::Interrupted);
+    }
     Ok(report)
 }
 

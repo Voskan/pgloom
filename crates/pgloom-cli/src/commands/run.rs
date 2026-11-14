@@ -5,7 +5,7 @@ use pgloom_engine::{RunOutcome, RunReport};
 use pgloom_report::{AUDIT_FOOTER, ReportContext, ReproFile, render_json, render_run};
 
 use crate::cli::{Format, RunArgs};
-use crate::error::{CliError, EXIT_PASS, EXIT_VIOLATION};
+use crate::error::{CliError, EXIT_INTERRUPTED, EXIT_PASS, EXIT_VIOLATION};
 use crate::output::Printer;
 use crate::session::{Overrides, RunOptions, Session};
 
@@ -29,7 +29,10 @@ pub fn plan_line(config: &Config) -> String {
             ReductionName::Dpor => "exhaustive (dpor)".to_owned(),
             ReductionName::None => "exhaustive".to_owned(),
         },
-        StrategyName::Bounded => format!("bounded (≤{} preemptions)", e.max_preemptions),
+        StrategyName::Bounded => format!(
+            "bounded (≤{} preemptions first, deeper while the budget lasts)",
+            e.max_preemptions
+        ),
         StrategyName::Random => format!("random (seed {})", e.seed.unwrap_or(0x5EED)),
     };
     format!(
@@ -43,6 +46,7 @@ pub fn report_context(config: &Config, workers: &[String], printer: &Printer) ->
     let mut ctx = ReportContext::new(config.name.clone(), workers.to_vec());
     ctx.color = printer.color;
     ctx.footer = (!printer.quiet).then(|| AUDIT_FOOTER.to_owned());
+    ctx.compact = printer.quiet;
     ctx.max_schedules = config.exploration.max_schedules;
     ctx.strategy = match config.exploration.strategy {
         StrategyName::Exhaustive => "exhaustive",
@@ -87,7 +91,11 @@ pub async fn run(args: RunArgs, printer: Printer) -> Result<u8, CliError> {
             started.elapsed().as_millis()
         ));
     }
+    let ticker = pretty.then(|| printer.spawn_progress(session.control()));
     let result = session.run().await;
+    if let Some(t) = ticker {
+        t.finish().await;
+    }
     let config = session.config().clone();
     let workers = session.workers().to_vec();
     session.close().await;
@@ -113,6 +121,7 @@ pub async fn run(args: RunArgs, printer: Printer) -> Result<u8, CliError> {
     };
     printer.report(&text);
     Ok(match report.outcome {
+        RunOutcome::Pass if report.interrupted => EXIT_INTERRUPTED,
         RunOutcome::Pass => EXIT_PASS,
         RunOutcome::ViolationFound => EXIT_VIOLATION,
     })

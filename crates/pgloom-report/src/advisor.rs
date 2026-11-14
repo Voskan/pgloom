@@ -17,6 +17,7 @@ pub enum Pattern {
     PhantomInsert,
     CheckThenAct,
     LostUpdate,
+    WriteSkew,
 }
 
 impl Pattern {
@@ -26,6 +27,7 @@ impl Pattern {
             Pattern::PhantomInsert => "Phantom Insert / Missing Unique Constraint",
             Pattern::CheckThenAct => "Unprotected Check-Then-Act under READ COMMITTED",
             Pattern::LostUpdate => "Lost Update (value computed in application memory)",
+            Pattern::WriteSkew => "Write Skew (a check over a set of rows, then a write to one)",
         }
     }
 }
@@ -43,9 +45,10 @@ pub struct Advice {
     pub fixes: Vec<Fix>,
 }
 
-/// Statements a worker executed, in order, with their classification.
+/// Statements a worker executed, in order, with their bind parameters.
 struct Trace<'a> {
     sql: Vec<&'a str>,
+    params: Vec<&'a [String]>,
 }
 
 fn traces(record: &EpisodeRecord) -> BTreeMap<WorkerId, Trace<'_>> {
@@ -56,10 +59,12 @@ fn traces(record: &EpisodeRecord) -> BTreeMap<WorkerId, Trace<'_>> {
             StepAction::Execute | StepAction::Begin | StepAction::Park { .. }
         ) && !step.sql.is_empty()
         {
-            out.entry(step.worker)
-                .or_insert_with(|| Trace { sql: Vec::new() })
-                .sql
-                .push(&step.sql);
+            let t = out.entry(step.worker).or_insert_with(|| Trace {
+                sql: Vec::new(),
+                params: Vec::new(),
+            });
+            t.sql.push(&step.sql);
+            t.params.push(&step.params);
         }
     }
     out
@@ -71,6 +76,10 @@ struct ReadThenWrite<'a> {
     table: String,
     read: &'a str,
     write: &'a str,
+    write_params: &'a [String],
+    /// An earlier unlocked read of a table this transaction never writes,
+    /// such as the parent row whose limit the transaction enforces.
+    parent: Option<&'a str>,
 }
 
 fn read_then_write<'a>(trace: &Trace<'a>) -> Option<ReadThenWrite<'a>> {
@@ -80,11 +89,31 @@ fn read_then_write<'a>(trace: &Trace<'a>) -> Option<ReadThenWrite<'a>> {
             continue;
         }
         for table in meta.read_tables() {
-            if let Some(write) = trace.sql[i + 1..]
+            if let Some(j) = trace.sql[i + 1..]
                 .iter()
-                .find(|w| classify_sql(w).write_tables().contains(&table))
+                .position(|w| classify_sql(w).write_tables().contains(&table))
             {
-                return Some(ReadThenWrite { table, read, write });
+                let j = i + 1 + j;
+                let written: Vec<String> = trace
+                    .sql
+                    .iter()
+                    .flat_map(|w| classify_sql(w).write_tables())
+                    .collect();
+                let parent = trace.sql[..j].iter().copied().find(|r| {
+                    let m = classify_sql(r);
+                    !m.has_write()
+                        && m.row_lock().is_none()
+                        && !is_aggregate_read(r)
+                        && !m.read_tables().is_empty()
+                        && m.read_tables().iter().all(|t| !written.contains(t))
+                });
+                return Some(ReadThenWrite {
+                    table,
+                    read,
+                    write: trace.sql[j],
+                    write_params: trace.params[j],
+                    parent,
+                });
             }
         }
     }
@@ -136,30 +165,86 @@ pub fn advise(record: &EpisodeRecord, violations: &[Violation], names: &[String]
             Some(ret) => format!("{insert_body} ON CONFLICT DO NOTHING {ret};"),
             None => format!("{insert_body} ON CONFLICT DO NOTHING;"),
         };
+        let mut fixes = Vec::new();
+        if let Some(parent) = first.parent {
+            let parent = one_line(parent).trim_end_matches(';').to_owned();
+            let parent_table = classify_sql(&parent)
+                .read_tables()
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            fixes.push(Fix {
+                title: "Fix Option A (Lock the parent row first):".into(),
+                sql: vec![
+                    format!("{parent} FOR NO KEY UPDATE;"),
+                    format!(
+                        "-- checks and inserts for the same `{parent_table}` row now run one at a time."),
+                ],
+            });
+        }
+        fixes.push(Fix {
+            title: format!(
+                "Fix Option {} (Unique Constraint, when at most one row may exist):",
+                option(fixes.len())
+            ),
+            sql: vec![
+                format!("CREATE UNIQUE INDEX CONCURRENTLY ON {table} (<natural key columns>);"),
+                on_conflict,
+                "-- and treat rows_affected == 0 as \"already exists\".".into(),
+            ],
+        });
+        if first.parent.is_none() {
+            fixes.push(Fix {
+                title: format!("Fix Option {} (Serialize on the key):", option(fixes.len())),
+                sql: vec![
+                    "SELECT pg_advisory_xact_lock(hashtext(<natural key>));".into(),
+                    format!("-- then run: {read}"),
+                ],
+            });
+        }
         out.push(Advice {
             pattern: Pattern::PhantomInsert,
             explanation: vec![
-                format!("{subject} checked `{table}` for an existing row and then inserted one."),
+                format!("{subject} checked `{table}` for existing rows and then inserted one."),
                 "Under READ COMMITTED neither transaction sees the other's uncommitted row, and \
                  SELECT ... FOR UPDATE cannot lock a row that does not exist yet."
                     .into(),
             ],
+            fixes,
+        });
+        return out;
+    }
+
+    let skew = is_write_skew(first, &found);
+    if skew {
+        let lock = lock_rows_read(&read).unwrap_or_else(|| {
+            format!("SELECT 1 FROM {table} WHERE <the rows you checked> FOR NO KEY UPDATE;")
+        });
+        out.push(Advice {
+            pattern: Pattern::WriteSkew,
+            explanation: vec![
+                format!(
+                    "{subject} checked a condition over several `{table}` rows and then changed \
+                     a different row in a later statement."
+                ),
+                "The transactions write different rows, so their row locks never conflict; each \
+                 one's check passed on a state the other was about to invalidate."
+                    .into(),
+            ],
             fixes: vec![
                 Fix {
-                    title: "Fix Option A (Unique Constraint):".into(),
+                    title: "Fix Option A (Lock every row the check depends on):".into(),
                     sql: vec![
-                        format!(
-                            "CREATE UNIQUE INDEX CONCURRENTLY ON {table} (<natural key columns>);"
-                        ),
-                        on_conflict,
-                        "-- and treat rows_affected == 0 as \"already exists\".".into(),
+                        lock,
+                        format!("-- run it before the check: {read}"),
                     ],
                 },
                 Fix {
-                    title: "Fix Option B (Serialize on the key):".into(),
+                    title: "Fix Option B (Serializable isolation):".into(),
                     sql: vec![
-                        "SELECT pg_advisory_xact_lock(hashtext(<natural key>));".into(),
-                        format!("-- then run: {read}"),
+                        "BEGIN ISOLATION LEVEL SERIALIZABLE;".into(),
+                        "-- and retry the whole transaction on SQLSTATE 40001 (serialization_failure)."
+                            .into(),
                     ],
                 },
             ],
@@ -184,7 +269,58 @@ pub fn advise(record: &EpisodeRecord, violations: &[Violation], names: &[String]
                 .into(),
         );
     }
-    let guarded = guarded_update(first.write);
+    let lock = if is_aggregate_read(&read) {
+        lock_rows_read(&read)
+    } else {
+        Some(format!("{read} FOR NO KEY UPDATE;"))
+    };
+    let mut fixes = Vec::new();
+    if let Some(lock) = lock {
+        fixes.push(Fix {
+            title: "Fix Option A (Pessimistic Lock):".into(),
+            sql: vec![
+                lock,
+                "-- FOR NO KEY UPDATE blocks concurrent writers of the row but, unlike \
+                 FOR UPDATE, not inserts of rows referencing it by foreign key."
+                    .into(),
+            ],
+        });
+    }
+    match (lost, atomic_update(first.write)) {
+        (true, Some((increment, compare_and_set, col))) => {
+            fixes.push(Fix {
+                title: format!("Fix Option {} (Atomic Update):", option(fixes.len())),
+                sql: vec![
+                    increment,
+                    format!(
+                        "-- compute the change in SQL, not in application memory; add \
+                         `AND {col} + <delta> >= 0` if the value must not go negative."
+                    ),
+                ],
+            });
+            fixes.push(Fix {
+                title: format!("Fix Option {} (Compare-and-Set):", option(fixes.len())),
+                sql: vec![
+                    compare_and_set,
+                    "-- rows_affected == 0 means another transaction changed the row: re-read \
+                     and retry, or report a conflict."
+                        .into(),
+                ],
+            });
+        }
+        _ => fixes.push(Fix {
+            title: format!(
+                "Fix Option {} (Atomic Guarded Update):",
+                option(fixes.len())
+            ),
+            sql: vec![
+                guarded_update(first.write).unwrap_or_else(|| {
+                    append_where_guard(&write, "<the condition you checked in application code>")
+                }),
+                "-- and verify rows_affected == 1 before reporting success.".into(),
+            ],
+        }),
+    }
     out.push(Advice {
         pattern: if lost {
             Pattern::LostUpdate
@@ -192,31 +328,130 @@ pub fn advise(record: &EpisodeRecord, violations: &[Violation], names: &[String]
             Pattern::CheckThenAct
         },
         explanation,
-        fixes: vec![
-            Fix {
-                title: "Fix Option A (Pessimistic Lock):".into(),
-                sql: vec![
-                    format!("{read} FOR NO KEY UPDATE;"),
-                    "-- FOR NO KEY UPDATE blocks concurrent writers of the row but, unlike \
-                     FOR UPDATE, not inserts of rows referencing it by foreign key."
-                        .into(),
-                ],
-            },
-            Fix {
-                title: "Fix Option B (Atomic Guarded Update):".into(),
-                sql: vec![
-                    guarded.unwrap_or_else(|| {
-                        append_where_guard(
-                            &write,
-                            "<the condition you checked in application code>",
-                        )
-                    }),
-                    "-- and verify rows_affected == 1 before reporting success.".into(),
-                ],
-            },
-        ],
+        fixes,
     });
     out
+}
+
+fn option(index: usize) -> char {
+    char::from(b'A' + (index.min(25) as u8))
+}
+
+/// The read cannot take a row lock as written: PostgreSQL rejects `FOR
+/// UPDATE` together with aggregates, `GROUP BY`, `HAVING` or `DISTINCT`.
+fn is_aggregate_read(sql: &str) -> bool {
+    let flat = one_line(sql).to_ascii_lowercase();
+    let Some(from) = find_top_level(&flat, " from ") else {
+        return false;
+    };
+    let projection = &flat[..from];
+    let compact: String = projection.chars().filter(|c| !c.is_whitespace()).collect();
+    [
+        "count(",
+        "sum(",
+        "avg(",
+        "min(",
+        "max(",
+        "bool_and(",
+        "bool_or(",
+        "every(",
+        "array_agg(",
+        "string_agg(",
+        "json_agg(",
+        "jsonb_agg(",
+    ]
+    .iter()
+    .any(|f| compact.contains(f))
+        || projection.trim_start().starts_with("select distinct")
+        || find_top_level(&flat, " group by ").is_some()
+        || find_top_level(&flat, " having ").is_some()
+}
+
+/// Rewrites a read into one that locks every row it looked at:
+/// `SELECT count(*) FROM t WHERE p` becomes `SELECT 1 FROM t WHERE p FOR NO
+/// KEY UPDATE;`. Returns `None` for set operations, which cannot be locked.
+fn lock_rows_read(sql: &str) -> Option<String> {
+    let flat = one_line(sql);
+    let flat = flat.trim_end_matches(';');
+    let lower = flat.to_ascii_lowercase();
+    if !lower.starts_with("select ")
+        || [" union ", " intersect ", " except "]
+            .iter()
+            .any(|op| find_top_level(&lower, op).is_some())
+    {
+        return None;
+    }
+    let from = find_top_level(&lower, " from ")?;
+    let end = [
+        " group by ",
+        " having ",
+        " order by ",
+        " limit ",
+        " offset ",
+    ]
+    .iter()
+    .filter_map(|k| find_top_level(&lower, k))
+    .min()
+    .unwrap_or(flat.len());
+    Some(format!("SELECT 1{} FOR NO KEY UPDATE;", &flat[from..end]))
+}
+
+/// The workers checked a set of rows rather than the row they changed: the
+/// read aggregates, or the same `UPDATE` ran with different arguments
+/// (different rows) in different workers.
+fn is_write_skew(first: &ReadThenWrite<'_>, found: &[(WorkerId, ReadThenWrite<'_>)]) -> bool {
+    if first_keyword(first.write) == "INSERT" {
+        return false;
+    }
+    if is_aggregate_read(first.read) {
+        return true;
+    }
+    let same_write: Vec<&ReadThenWrite<'_>> = found
+        .iter()
+        .map(|(_, rw)| rw)
+        .filter(|rw| rw.write == first.write && rw.read == first.read)
+        .collect();
+    same_write.len() > 1
+        && !first.write_params.is_empty()
+        && same_write
+            .iter()
+            .any(|rw| rw.write_params != first.write_params)
+        && !where_reads_params(first.read)
+}
+
+/// The read's `WHERE` clause compares against a bind parameter, so the
+/// workers may have checked different rows on purpose.
+fn where_reads_params(sql: &str) -> bool {
+    let flat = one_line(sql);
+    find_top_level(&flat.to_ascii_lowercase(), " where ").is_some_and(|w| flat[w..].contains('$'))
+}
+
+/// For an absolute `SET c = $1 WHERE p`, proposes the in-SQL increment
+/// `SET c = c + <delta> WHERE p` and the compare-and-set
+/// `SET c = $1 WHERE p AND c = <value you read>`.
+fn atomic_update(sql: &str) -> Option<(String, String, String)> {
+    let u = split_update(sql)?;
+    let assigned = assignments(&u.set_clause);
+    let cols: Vec<&str> = assigned.iter().map(|(c, _)| c.as_str()).collect();
+    let increment = SplitUpdate {
+        head: u.head.clone(),
+        set_clause: cols
+            .iter()
+            .map(|c| format!("{c} = {c} + <delta>"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        from_clause: u.from_clause.clone(),
+        cond: u.cond.clone(),
+        returning: u.returning.clone(),
+    }
+    .render(None);
+    let expected = cols
+        .iter()
+        .map(|c| format!("{c} = <value you read>"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let first = cols.first()?.to_string();
+    Some((increment, u.render_with_guard(&expected), first))
 }
 
 fn lock_order(
@@ -322,20 +557,26 @@ struct SplitUpdate {
 
 impl SplitUpdate {
     fn render_with_guard(&self, guard: &str) -> String {
+        self.render(Some(guard))
+    }
+
+    fn render(&self, guard: Option<&str>) -> String {
         let from = self
             .from_clause
             .as_deref()
             .map_or_else(String::new, |f| format!(" {f}"));
-        let where_body = match &self.cond {
-            Some(c) => format!("{c} AND {guard}"),
-            None => guard.to_owned(),
+        let where_body = match (&self.cond, guard) {
+            (Some(c), Some(g)) => format!(" WHERE {c} AND {g}"),
+            (Some(c), None) => format!(" WHERE {c}"),
+            (None, Some(g)) => format!(" WHERE {g}"),
+            (None, None) => String::new(),
         };
         let ret = self
             .returning
             .as_deref()
             .map_or_else(String::new, |r| format!(" {r}"));
         format!(
-            "{} SET {}{from} WHERE {where_body}{ret};",
+            "{} SET {}{from}{where_body}{ret};",
             self.head, self.set_clause
         )
     }
@@ -405,12 +646,39 @@ fn is_absolute_assignment(sql: &str) -> bool {
         return false;
     };
     let a = assignments(&u.set_clause);
-    !a.is_empty()
-        && a.iter().all(|(_, e)| {
-            e.strip_prefix('$')
-                .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
-                || e.parse::<f64>().is_ok()
-        })
+    !a.is_empty() && a.iter().all(|(_, e)| is_constant(e))
+}
+
+/// A bind parameter or literal, possibly cast the way ORMs emit them:
+/// `$1`, `$1::INTEGER`, `CAST($1 AS numeric)`, `42`, `'text'`, `true`.
+fn is_constant(expr: &str) -> bool {
+    let mut e = expr.trim();
+    let lower = e.to_ascii_lowercase();
+    if lower.starts_with("cast(") && e.ends_with(')') {
+        let inner = &e[5..e.len() - 1];
+        return find_top_level(&inner.to_ascii_lowercase(), " as ")
+            .is_some_and(|p| is_constant(&inner[..p]));
+    }
+    if let Some(p) = top_level_offsets(e)
+        .into_iter()
+        .find(|&i| e.get(i..i + 2) == Some("::"))
+    {
+        let type_name = &e[p + 2..];
+        let is_type = type_name.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '_' | ' ' | '.' | '"' | ':' | '[' | ']' | '(' | ')' | ',')
+        });
+        if !is_type {
+            return false;
+        }
+        e = e[..p].trim();
+    }
+    let lower = e.to_ascii_lowercase();
+    e.strip_prefix('$')
+        .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
+        || e.parse::<f64>().is_ok()
+        || (e.starts_with('\'') && top_level_offsets(e).is_empty())
+        || matches!(lower.as_str(), "true" | "false" | "null")
 }
 
 /// For `SET c = c - x WHERE p [RETURNING ...]`, proposes
@@ -480,7 +748,10 @@ mod tests {
         ]);
         let a = &advise(&r, &[], &names())[0];
         assert_eq!(a.pattern, Pattern::LostUpdate);
-        assert!(a.fixes[1].sql[0].contains("<the condition you checked"));
+        assert_eq!(
+            a.fixes[1].sql[0],
+            "UPDATE wallets SET balance = balance + <delta> WHERE id = 1;"
+        );
     }
 
     #[test]
@@ -509,6 +780,139 @@ mod tests {
             a.fixes[0].sql[1],
             "INSERT INTO bookings (slot) VALUES (7) ON CONFLICT DO NOTHING;"
         );
+    }
+
+    #[test]
+    fn orm_casts_are_absolute_writes() {
+        assert!(is_absolute_assignment(
+            "UPDATE products SET stock=$1::INTEGER WHERE products.id = $2::INTEGER"
+        ));
+        assert!(is_absolute_assignment(
+            "UPDATE t SET a = CAST($1 AS numeric), b = 'x', c = true, d = $2::numeric(10, 2)"
+        ));
+        assert!(!is_absolute_assignment("UPDATE t SET a = 'x' || a"));
+        assert!(!is_absolute_assignment("UPDATE t SET a = $1::int + a"));
+    }
+
+    #[test]
+    fn lost_updates_propose_an_in_sql_change_and_compare_and_set() {
+        let r = record(&[
+            (0, "SELECT stock FROM products WHERE id = $1::INTEGER"),
+            (
+                0,
+                "UPDATE products SET stock=$1::INTEGER WHERE products.id = $2::INTEGER",
+            ),
+        ]);
+        let a = &advise(&r, &[], &names())[0];
+        assert_eq!(a.pattern, Pattern::LostUpdate);
+        assert_eq!(a.fixes[1].title, "Fix Option B (Atomic Update):");
+        assert_eq!(
+            a.fixes[1].sql[0],
+            "UPDATE products SET stock = stock + <delta> WHERE products.id = $2::INTEGER;"
+        );
+        assert_eq!(a.fixes[2].title, "Fix Option C (Compare-and-Set):");
+        assert_eq!(
+            a.fixes[2].sql[0],
+            "UPDATE products SET stock=$1::INTEGER WHERE products.id = $2::INTEGER AND stock = <value you read>;"
+        );
+    }
+
+    #[test]
+    fn aggregate_check_then_update_of_one_row_is_write_skew() {
+        let r = record(&[
+            (0, "SELECT count(*) FROM doctors WHERE on_call"),
+            (1, "SELECT count(*) FROM doctors WHERE on_call"),
+            (0, "UPDATE doctors SET on_call = false WHERE id = $1"),
+            (1, "UPDATE doctors SET on_call = false WHERE id = $1"),
+        ]);
+        let a = &advise(&r, &[], &names())[0];
+        assert_eq!(a.pattern, Pattern::WriteSkew);
+        assert_eq!(
+            a.fixes[0].sql[0],
+            "SELECT 1 FROM doctors WHERE on_call FOR NO KEY UPDATE;"
+        );
+        assert!(a.fixes[1].sql[0].contains("SERIALIZABLE"));
+        assert!(
+            a.fixes
+                .iter()
+                .flat_map(|f| &f.sql)
+                .all(|s| !s.contains("count(*) FROM doctors WHERE on_call FOR"))
+        );
+    }
+
+    #[test]
+    fn same_statement_on_different_rows_is_write_skew() {
+        let mut r = record(&[
+            (0, "SELECT id FROM doctors WHERE on_call"),
+            (1, "SELECT id FROM doctors WHERE on_call"),
+            (0, "UPDATE doctors SET on_call = false WHERE id = $1"),
+            (1, "UPDATE doctors SET on_call = false WHERE id = $1"),
+        ]);
+        r.steps[2].params = vec!["1".into()];
+        r.steps[3].params = vec!["2".into()];
+        assert_eq!(advise(&r, &[], &names())[0].pattern, Pattern::WriteSkew);
+
+        r.steps[3].params = vec!["1".into()];
+        assert_eq!(advise(&r, &[], &names())[0].pattern, Pattern::LostUpdate);
+    }
+
+    #[test]
+    fn aggregate_reads_are_never_given_a_row_lock_clause() {
+        let r = record(&[
+            (
+                0,
+                "SELECT sum(qty) FROM orders WHERE product_id = 1 GROUP BY product_id",
+            ),
+            (0, "INSERT INTO orders (product_id, qty) VALUES (1, 1)"),
+        ]);
+        for fix in &advise(&r, &[], &names())[0].fixes {
+            for sql in &fix.sql {
+                assert!(
+                    !sql.contains(
+                        "sum(qty) FROM orders WHERE product_id = 1 GROUP BY product_id FOR"
+                    )
+                );
+            }
+        }
+        assert_eq!(
+            lock_rows_read("SELECT count(*) FROM t WHERE a = 1 GROUP BY b ORDER BY 1"),
+            Some("SELECT 1 FROM t WHERE a = 1 FOR NO KEY UPDATE;".into())
+        );
+        assert_eq!(
+            lock_rows_read("SELECT a FROM t UNION SELECT a FROM u"),
+            None
+        );
+        assert!(is_aggregate_read("SELECT DISTINCT a FROM t"));
+        assert!(is_aggregate_read("SELECT COUNT (*) FROM t"));
+        assert!(!is_aggregate_read(
+            "SELECT a FROM t WHERE b IN (SELECT max(b) FROM u)"
+        ));
+    }
+
+    #[test]
+    fn limit_checks_lock_the_parent_row() {
+        let r = record(&[
+            (0, "BEGIN"),
+            (0, "SELECT max_uses FROM coupons WHERE code = $1"),
+            (0, "SELECT count(*) FROM redemptions WHERE code = $1"),
+            (0, "INSERT INTO redemptions (code, user_id) VALUES ($1, $2)"),
+        ]);
+        let a = &advise(&r, &[], &names())[0];
+        assert_eq!(a.pattern, Pattern::PhantomInsert);
+        assert_eq!(
+            a.fixes[0].title,
+            "Fix Option A (Lock the parent row first):"
+        );
+        assert_eq!(
+            a.fixes[0].sql[0],
+            "SELECT max_uses FROM coupons WHERE code = $1 FOR NO KEY UPDATE;"
+        );
+        assert!(
+            a.fixes[1]
+                .title
+                .starts_with("Fix Option B (Unique Constraint")
+        );
+        assert_eq!(a.fixes.len(), 2);
     }
 
     #[test]
@@ -558,8 +962,8 @@ mod tests {
         let a = &advise(&lost, &[], &names())[0];
         assert_eq!(a.pattern, Pattern::LostUpdate);
         assert_eq!(
-            a.fixes[1].sql[0],
-            "UPDATE wallets SET balance = $1 WHERE id = $2 AND <the condition you checked in application code> RETURNING balance;"
+            a.fixes[2].sql[0],
+            "UPDATE wallets SET balance = $1 WHERE id = $2 AND balance = <value you read> RETURNING balance;"
         );
 
         let ins = record(&[

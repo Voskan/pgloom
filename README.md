@@ -96,8 +96,8 @@ cannot see a SQL transaction.
 PgLoom controls the one place every request must pass through: the database
 connection. Interleaving at the granularity of whole protocol round trips is
 small enough to explore exhaustively for two or three requests and exactly
-fine-grained enough to expose check-then-act races, lost updates, phantom
-inserts and lock-order deadlocks.
+fine-grained enough to expose check-then-act races, lost updates, write
+skew, phantom inserts and lock-order deadlocks.
 
 ## Install
 
@@ -276,19 +276,52 @@ Global flags: `--color auto|always|never`, `--quiet`, `-v`/`-vv`.
 | --- | --- |
 | `0` | Every explored schedule satisfied every invariant. |
 | `1` | A violation or deadlock was found; a repro file was written. |
-| `2` | Invalid scenario, unreachable database, or the service did not start. |
+| `2` | Invalid scenario, unreachable database, the service did not start or exited, or no SQL from the workers reached the proxy (the service bypassed it). |
 | `3` | Internal error, such as a step that neither completed nor waited on a lock. |
+| `130` | Interrupted with Ctrl+C. The first press finishes the current schedule and restores the database; a second one aborts at once. |
 
 ### In CI
 
+A GitHub Actions job with a PostgreSQL service container. PgLoom starts the
+service itself through `target.command`, so build it first:
+
 ```yaml
-- run: pgloom run --format json --quiet > pgloom-report.json
-- uses: actions/upload-artifact@v4
-  if: failure()
-  with:
-    name: pgloom-repro
-    path: .pgloom-repro.json
+pgloom:
+  runs-on: ubuntu-latest
+  services:
+    postgres:
+      image: postgres:17-alpine
+      env:
+        POSTGRES_PASSWORD: postgres
+      ports: ["5432:5432"]
+      options: >-
+        --health-cmd "pg_isready -U postgres"
+        --health-interval 2s --health-timeout 5s --health-retries 20
+  env:
+    PGLOOM_UPSTREAM_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+  steps:
+    - uses: actions/checkout@v4
+    - name: Install PgLoom
+      run: |
+        curl -sSfL https://github.com/Voskan/pgloom/releases/latest/download/pgloom-x86_64-unknown-linux-musl.tar.gz \
+          | tar -xz -C "$RUNNER_TEMP"
+        echo "$RUNNER_TEMP/pgloom-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+    - run: go build -o app .        # or however the service is built
+    - run: pgloom run --quiet --format json > pgloom-report.json
+    - uses: actions/upload-artifact@v4
+      if: failure()
+      with:
+        name: pgloom-repro
+        path: |
+          .pgloom-repro.json
+          pgloom-report.json
 ```
+
+`--quiet` keeps the log to the verdict and the violated invariants; the full
+timeline and Fix Advisor are in the JSON report, and `pgloom replay
+.pgloom-repro.json` replays the failing schedule locally. Pin a version with
+`releases/download/vX.Y.Z/pgloom-vX.Y.Z-<target>.tar.gz` when the build must
+be reproducible.
 
 ## Limits
 

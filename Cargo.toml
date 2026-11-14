@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
@@ -13,11 +13,11 @@ keywords = ["postgres", "race-condition", "model-checker", "testing", "concurren
 categories = ["development-tools::testing", "database"]
 
 [workspace.dependencies]
-pgloom-wire = { path = "crates/pgloom-wire", version = "0.1.0" }
-pgloom-pgctrl = { path = "crates/pgloom-pgctrl", version = "0.1.0" }
-pgloom-engine = { path = "crates/pgloom-engine", version = "0.1.0" }
-pgloom-driver = { path = "crates/pgloom-driver", version = "0.1.0" }
-pgloom-report = { path = "crates/pgloom-report", version = "0.1.0" }
+pgloom-wire = { path = "crates/pgloom-wire", version = "0.1.1" }
+pgloom-pgctrl = { path = "crates/pgloom-pgctrl", version = "0.1.1" }
+pgloom-engine = { path = "crates/pgloom-engine", version = "0.1.1" }
+pgloom-driver = { path = "crates/pgloom-driver", version = "0.1.1" }
+pgloom-report = { path = "crates/pgloom-report", version = "0.1.1" }
 
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 bytes = "1.12"

@@ -7,14 +7,14 @@ pub enum PgCtrlError {
     #[error("{0}")]
     Config(String),
 
-    #[error("cannot connect to PostgreSQL at {target}: {source}")]
+    #[error("cannot connect to PostgreSQL at {target}: {}", detail(source))]
     Connect {
         target: String,
         #[source]
         source: tokio_postgres::Error,
     },
 
-    #[error("{context}: {source}")]
+    #[error("{context}: {}", detail(source))]
     Query {
         context: String,
         #[source]
@@ -46,6 +46,31 @@ impl PgCtrlError {
 }
 
 pub type PgCtrlResult<T> = Result<T, PgCtrlError>;
+
+/// The actionable part of a driver error. `tokio_postgres::Error` displays
+/// only its category ("db error", "error connecting to server"); the server
+/// message or the operating-system cause sits behind it.
+pub fn detail(err: &tokio_postgres::Error) -> String {
+    if let Some(db) = err.as_db_error() {
+        let mut out = format!("{} (SQLSTATE {})", db.message(), db.code().code());
+        if let Some(hint) = db.hint() {
+            out.push_str("; hint: ");
+            out.push_str(hint);
+        }
+        return out;
+    }
+    let mut out = err.to_string();
+    let mut cause = std::error::Error::source(err);
+    while let Some(c) = cause {
+        let text = c.to_string();
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        cause = c.source();
+    }
+    out
+}
 
 /// Column access that reports a type mismatch or a missing column as an
 /// error instead of panicking like `Row::get`: catalog columns differ across

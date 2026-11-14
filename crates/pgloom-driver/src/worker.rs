@@ -226,7 +226,9 @@ async fn run_sql(
                     let _ = connection.await;
                 }),
             },
-            Err(e) => return WorkerOutcome::failed("connect error", e.to_string()),
+            Err(e) => {
+                return WorkerOutcome::failed("connect error", pgloom_pgctrl::error::detail(&e));
+            }
         },
     };
     let client = &session.client;

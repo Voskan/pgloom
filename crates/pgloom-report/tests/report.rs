@@ -213,6 +213,7 @@ fn report(failure: Failure) -> RunReport {
         elapsed: Duration::from_millis(142),
         parks: 2,
         failures: vec![failure],
+        ..RunReport::default()
     }
 }
 
@@ -280,6 +281,7 @@ fn pass_report() {
         elapsed: Duration::from_millis(84),
         parks: 3,
         failures: vec![],
+        ..RunReport::default()
     };
     assert_eq!(
         render_run(&ctx("wallet"), &r),
@@ -300,6 +302,7 @@ fn reduced_pass_report_says_how_coverage_was_reached() {
         elapsed: Duration::from_millis(29),
         parks: 0,
         failures: vec![],
+        ..RunReport::default()
     };
     assert_eq!(
         render_run(&ctx("wallet"), &r),
@@ -321,6 +324,7 @@ fn footer_closes_violation_reports_only() {
         elapsed: Duration::from_millis(1),
         parks: 0,
         failures: vec![],
+        ..RunReport::default()
     };
     assert!(!render_run(&c, &pass).contains(AUDIT_FOOTER));
     assert!(!render_json(&c, &report(double_spend())).contains("voskan1989@gmail.com"));
@@ -407,4 +411,46 @@ fn repro_rejects_other_versions_and_garbage() {
     let err = ReproFile::parse(&repro.to_json(), "f.json").unwrap_err();
     assert!(err.to_string().contains("format 99"), "{err}");
     assert!(ReproFile::parse("{", "f.json").is_err());
+}
+
+#[test]
+fn interrupted_runs_say_exploration_is_incomplete() {
+    let pass = RunReport {
+        outcome: RunOutcome::Pass,
+        stats: ExplorationStats {
+            schedules: 9,
+            ..ExplorationStats::default()
+        },
+        elapsed: Duration::from_millis(50),
+        interrupted: true,
+        ..RunReport::default()
+    };
+    let text = render_run(&ctx("wallet"), &pass);
+    assert!(text.starts_with("■ INTERRUPTED  [wallet]\n"), "{text}");
+    assert!(text.contains("exploration incomplete"), "{text}");
+    assert!(!text.contains("NO ANOMALIES FOUND"), "{text}");
+    let json: serde_json::Value =
+        serde_json::from_str(&render_json(&ctx("wallet"), &pass)).unwrap();
+    assert_eq!(json["result"], "interrupted");
+    assert_eq!(json["interrupted"], true);
+
+    let mut failed = report(double_spend());
+    failed.interrupted = true;
+    let text = render_run(&ctx("wallet"), &failed);
+    assert!(
+        text.contains("other interleavings were not explored"),
+        "{text}"
+    );
+}
+
+#[test]
+fn quiet_reports_keep_the_verdict_and_drop_the_timeline() {
+    let mut c = ctx("wallet");
+    c.compact = true;
+    let text = render_run(&c, &report(double_spend()));
+    assert!(text.contains("RACE CONDITION DETECTED"), "{text}");
+    assert!(text.contains("Violated Invariants:"), "{text}");
+    assert!(text.contains("pgloom replay"), "{text}");
+    assert!(!text.contains("Timeline"), "{text}");
+    assert!(!text.contains("Fix Advisor"), "{text}");
 }

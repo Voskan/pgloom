@@ -10,6 +10,8 @@ pub const EXIT_VIOLATION: u8 = 1;
 pub const EXIT_CONFIG: u8 = 2;
 /// Protocol error, step timeout or other unexpected failure.
 pub const EXIT_INTERNAL: u8 = 3;
+/// Stopped by Ctrl+C (128 + SIGINT, as shells report it).
+pub const EXIT_INTERRUPTED: u8 = 130;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
@@ -23,6 +25,8 @@ pub enum CliError {
     Engine(#[from] EngineError),
     #[error("{0}")]
     Internal(String),
+    #[error("interrupted")]
+    Interrupted,
 }
 
 impl CliError {
@@ -30,6 +34,7 @@ impl CliError {
         match self {
             CliError::Config(_) | CliError::Environment(_) => EXIT_CONFIG,
             CliError::Engine(_) | CliError::Internal(_) => EXIT_INTERNAL,
+            CliError::Interrupted => EXIT_INTERRUPTED,
         }
     }
 

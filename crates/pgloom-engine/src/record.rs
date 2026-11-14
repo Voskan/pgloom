@@ -190,4 +190,18 @@ impl EpisodeRecord {
     pub fn success_count(&self) -> usize {
         self.outcomes.iter().flatten().filter(|o| o.success).count()
     }
+
+    /// Database turns that went through the proxy. A parked turn is counted
+    /// once, when it parks.
+    pub fn turns(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.action,
+                    StepAction::Execute | StepAction::Begin | StepAction::Park { .. }
+                )
+            })
+            .count()
+    }
 }

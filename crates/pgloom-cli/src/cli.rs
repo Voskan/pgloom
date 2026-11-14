@@ -21,7 +21,8 @@ pub struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = ColorChoice::Auto)]
     pub color: ColorChoice,
 
-    /// Print only the final verdict and errors.
+    /// Print only the verdict, the violated invariants and errors (no
+    /// timeline or Fix Advisor).
     #[arg(short, long, global = true)]
     pub quiet: bool,
 
@@ -112,10 +113,13 @@ pub struct RunArgs {
     #[command(flatten)]
     pub connection: ConnectionArgs,
 
+    /// How to explore schedules (overrides exploration.strategy): every
+    /// interleaving, fewest preemptions first, or random.
     #[arg(long, value_enum)]
     pub strategy: Option<StrategyArg>,
 
-    /// Preemption bound per schedule for the bounded strategy.
+    /// Bounded strategy: explore every schedule with up to N preemptions
+    /// first. Deeper levels follow only while --max-schedules allows.
     #[arg(long, value_name = "N")]
     pub max_preemptions: Option<u32>,
 
@@ -144,6 +148,7 @@ pub struct RunArgs {
     #[arg(long, value_name = "PATH", default_value = pgloom_report::DEFAULT_REPRO_PATH)]
     pub repro_out: PathBuf,
 
+    /// Report format: a human-readable report, or JSON on stdout for CI.
     #[arg(long, value_enum, default_value_t = Format::Pretty)]
     pub format: Format,
 

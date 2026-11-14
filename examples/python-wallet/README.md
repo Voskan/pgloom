@@ -6,6 +6,8 @@ lost update that ORMs make easy. PgLoom starts it, sends two concurrent $60
 withdrawals from a wallet holding $100, and explores every interleaving of
 their transactions.
 
+It needs Python 3.9 or newer; CI runs it on 3.9 and 3.13.
+
 ```console
 $ python3 -m venv .venv && . .venv/bin/activate
 $ pip install -r requirements.txt

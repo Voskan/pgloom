@@ -114,7 +114,13 @@ jobs:
           WALLET_FIX=atomic ../../target/debug/pgloom run --color never
 
   example-python:
+    name: example-python (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest and newest supported versions.
+        python: ["3.9", "3.13"]
     services:
       postgres:
         image: postgres:17-alpine
@@ -135,7 +141,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: examples/python-wallet/requirements.txt
       - run: pip install -r examples/python-wallet/requirements.txt

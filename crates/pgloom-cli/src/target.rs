@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::CliError;
 
@@ -61,25 +61,42 @@ impl TargetProcess {
         self.log.lock().await.join("\n")
     }
 
+    /// Shared buffer of the last lines the process printed.
+    pub fn log_handle(&self) -> std::sync::Arc<Mutex<Vec<String>>> {
+        self.log.clone()
+    }
+
+    /// The exit status, if the process has already terminated.
+    pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+
     /// Polls `url` until it answers with a non-5xx status, failing early if
     /// the process exits.
     pub async fn wait_ready(&mut self, url: &str, timeout: Duration) -> Result<(), CliError> {
         let client = http_client()?;
         let deadline = Instant::now() + timeout;
         loop {
-            if let Ok(Some(status)) = self.child.try_wait() {
+            if let Some(status) = self.exit_status() {
+                let tail = self.log_tail().await;
                 return Err(CliError::Environment(format!(
-                    "target exited with {status} before {url} became ready{}",
-                    with_output(&self.log_tail().await)
+                    "target exited with {status} before {url} became ready{}{}",
+                    with_output(&tail),
+                    tls_hint(&tail)
                 )));
             }
             match probe(&client, url).await {
-                Ok(()) => return Ok(()),
+                Ok(status) => {
+                    warn_unhealthy(url, status);
+                    return Ok(());
+                }
                 Err(last) if Instant::now() >= deadline => {
+                    let tail = self.log_tail().await;
                     return Err(CliError::Environment(format!(
-                        "target service at {url} is not ready after {}ms ({last}){}",
+                        "target service at {url} is not ready after {}ms ({last}){}{}",
                         timeout.as_millis(),
-                        with_output(&self.log_tail().await)
+                        with_output(&tail),
+                        tls_hint(&tail)
                     )));
                 }
                 Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
@@ -138,6 +155,27 @@ async fn collect<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 
+/// The proxy refuses `SSLRequest`, so a client that insists on TLS fails
+/// before it sends a single query.
+fn tls_hint(tail: &str) -> &'static str {
+    let lower = tail.to_ascii_lowercase();
+    if lower.contains("tls") || lower.contains("ssl") {
+        "\nhint: the PgLoom proxy does not speak TLS; add sslmode=disable to the service's DATABASE_URL"
+    } else {
+        ""
+    }
+}
+
+/// A 4xx readiness answer proves the server is up but usually means the
+/// path is wrong, which is worth a word before the run starts.
+fn warn_unhealthy(url: &str, status: u16) {
+    if (400..500).contains(&status) {
+        warn!(
+            "{url} answered HTTP {status}; treating the service as ready, but check target.ready_http"
+        );
+    }
+}
+
 fn with_output(tail: &str) -> String {
     if tail.is_empty() {
         String::new()
@@ -153,11 +191,19 @@ fn http_client() -> Result<reqwest::Client, CliError> {
         .map_err(|e| CliError::Internal(e.to_string()))
 }
 
-async fn probe(client: &reqwest::Client, url: &str) -> Result<(), String> {
+async fn probe(client: &reqwest::Client, url: &str) -> Result<u16, String> {
     match client.get(url).send().await {
-        Ok(r) if !r.status().is_server_error() => Ok(()),
+        Ok(r) if !r.status().is_server_error() => Ok(r.status().as_u16()),
         Ok(r) => Err(format!("HTTP {}", r.status())),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Whether anything answers at `url` right now.
+pub async fn answers(url: &str) -> bool {
+    match http_client() {
+        Ok(client) => client.get(url).send().await.is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -167,7 +213,10 @@ pub async fn wait_http(url: &str, timeout: Duration) -> Result<(), CliError> {
     let deadline = Instant::now() + timeout;
     loop {
         match probe(&client, url).await {
-            Ok(()) => return Ok(()),
+            Ok(status) => {
+                warn_unhealthy(url, status);
+                return Ok(());
+            }
             Err(last) if Instant::now() >= deadline => {
                 return Err(CliError::Environment(format!(
                     "service at {url} is not ready after {}ms ({last})",

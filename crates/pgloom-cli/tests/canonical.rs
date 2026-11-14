@@ -558,3 +558,36 @@ async fn dpor_collapses_independent_workers() {
     );
     env.finish().await;
 }
+
+/// A service that talks to PostgreSQL directly, bypassing the proxy, must
+/// not be reported as race-free: nothing was explored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bypassing_the_proxy_is_an_error_not_a_pass() {
+    let Some(env) = Env::start(WalletMode::CheckThenAct).await else {
+        return;
+    };
+    let direct = WalletServer::start(
+        "127.0.0.1:0".parse().unwrap(),
+        env.db.url(),
+        "wallets",
+        WalletMode::CheckThenAct,
+    )
+    .await
+    .unwrap();
+    let yaml = env
+        .withdraw_yaml()
+        .replace(&env.wallet.url("/withdraw"), &direct.url("/withdraw"));
+    let session = Session::start(Env::config(&yaml), RunOptions::default())
+        .await
+        .unwrap();
+    let result = session.run().await;
+    session.close().await;
+    direct.stop().await;
+    let err = result.expect_err("a run with no proxied SQL must fail");
+    assert!(
+        err.to_string().contains("no SQL from the workers reached"),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), pgloom_cli::error::EXIT_CONFIG);
+    env.finish().await;
+}

@@ -21,6 +21,9 @@ pub mod oid {
     pub const FLOAT8: u32 = 701;
     pub const BPCHAR: u32 = 1042;
     pub const VARCHAR: u32 = 1043;
+    pub const DATE: u32 = 1082;
+    pub const TIMESTAMP: u32 = 1114;
+    pub const TIMESTAMPTZ: u32 = 1184;
     pub const NUMERIC: u32 = 1700;
     pub const UUID: u32 = 2950;
     pub const JSONB: u32 = 3802;
@@ -38,7 +41,55 @@ pub fn render_value(value: Option<&[u8]>, format: FormatCode, type_oid: u32) -> 
         FormatCode::Text => String::from_utf8_lossy(bytes).into_owned(),
         FormatCode::Binary => render_binary(bytes, type_oid),
     };
-    truncate(rendered)
+    truncate(escape_controls(rendered))
+}
+
+/// Keeps reports printable: raw control bytes would corrupt the timeline and
+/// make tools such as `grep` treat a whole CI log as binary.
+fn escape_controls(s: String) -> String {
+    if !s.chars().any(char::is_control) {
+        return s;
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Microseconds or days since 2000-01-01, PostgreSQL's binary epoch.
+fn render_date(days_since_2000: i64) -> String {
+    // Howard Hinnant's civil_from_days, shifted from the Unix epoch.
+    let z = days_since_2000 + 10_957 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn render_timestamp(micros: i64, utc: bool) -> String {
+    let days = micros.div_euclid(86_400_000_000);
+    let rest = micros.rem_euclid(86_400_000_000);
+    let (secs, frac) = (rest / 1_000_000, rest % 1_000_000);
+    let time = format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
+    let frac = if frac == 0 {
+        String::new()
+    } else {
+        format!(".{frac:06}").trim_end_matches('0').to_owned()
+    };
+    let zone = if utc { "+00" } else { "" };
+    format!("{} {time}{frac}{zone}", render_date(days))
 }
 
 fn render_binary(b: &[u8], type_oid: u32) -> String {
@@ -59,6 +110,11 @@ fn render_binary(b: &[u8], type_oid: u32) -> String {
         oid::UUID if b.len() == 16 => render_uuid(b),
         oid::NUMERIC => render_numeric(b).unwrap_or_else(fallback),
         oid::BYTEA => format!("\\x{}", hex(b)),
+        oid::DATE if b.len() == 4 => {
+            render_date(i64::from(i32::from_be_bytes([b[0], b[1], b[2], b[3]])))
+        }
+        oid::TIMESTAMP if b.len() == 8 => render_timestamp(i64::from_be_bytes(arr8(b)), false),
+        oid::TIMESTAMPTZ if b.len() == 8 => render_timestamp(i64::from_be_bytes(arr8(b)), true),
         // Unknown OID (0 means "let the server infer"): guess common widths.
         0 => match b.len() {
             4 => i32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string(),
@@ -160,6 +216,31 @@ fn truncate(mut s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dates_and_timestamps_decode_from_the_2000_epoch() {
+        assert_eq!(render_date(0), "2000-01-01");
+        assert_eq!(render_date(-1), "1999-12-31");
+        assert_eq!(render_date(9_445), "2025-11-10");
+        let micros = (9_445_i64 * 86_400 + 13 * 3600 + 5 * 60 + 7) * 1_000_000 + 250_000;
+        assert_eq!(
+            render_value(
+                Some(&micros.to_be_bytes()),
+                FormatCode::Binary,
+                oid::TIMESTAMPTZ
+            ),
+            "2025-11-10 13:05:07.25+00"
+        );
+    }
+
+    #[test]
+    fn control_bytes_are_escaped_not_printed() {
+        assert_eq!(
+            render_value(Some(b"\0\0\0\x01"), FormatCode::Text, 0),
+            "\\x00\\x00\\x00\\x01"
+        );
+        assert_eq!(render_value(Some(b"a\nb"), FormatCode::Text, 25), "a\\nb");
+    }
 
     #[test]
     fn renders_text_and_null() {

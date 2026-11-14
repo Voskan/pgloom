@@ -22,7 +22,7 @@ pub mod waitfor;
 
 pub use coordinator::{
     Coordinator, CoordinatorConfig, DbControl, EngineError, EpisodeOracle, EpisodeResult, Failure,
-    RunOutcome, RunReport, Workload,
+    RunControl, RunOutcome, RunReport, Workload,
 };
 pub use explore::{
     Decision, Divergence, ExplorationStats, Reduction, Schedule, ScheduleExplorer, Strategy,

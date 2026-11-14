@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::WireResult;
 use crate::frame::Frame;
 use crate::messages::{
-    ColumnDesc, ErrorFields, TxStatus, backend_tag, decode_command_complete, decode_data_row,
-    decode_ready_for_query, decode_row_description,
+    ColumnDesc, ErrorFields, FormatCode, TxStatus, backend_tag, decode_command_complete,
+    decode_data_row, decode_ready_for_query, decode_row_description,
 };
 use crate::values::render_value;
 
@@ -72,12 +72,24 @@ impl TurnResponse {
     }
 }
 
+/// Format of result column `i`: one code applies to every column, none
+/// means text (the `Bind` convention).
+fn broadcast_format(formats: &[FormatCode], i: usize) -> FormatCode {
+    match formats {
+        [] => FormatCode::Text,
+        [only] => *only,
+        many => many.get(i).copied().unwrap_or(FormatCode::Text),
+    }
+}
+
 /// Incrementally builds a [`TurnResponse`] from backend frames.
 #[derive(Debug, Default)]
 pub struct ResponseCollector {
     response: TurnResponse,
     columns: Vec<ColumnDesc>,
     described: bool,
+    /// Result formats requested by the turn's `Bind`.
+    bind_formats: Option<Vec<FormatCode>>,
 }
 
 impl ResponseCollector {
@@ -94,6 +106,14 @@ impl ResponseCollector {
         }
     }
 
+    /// The result formats the turn's `Bind` requested. A `RowDescription`
+    /// answering `Describe` of a *statement* reports every column as text,
+    /// because formats are only chosen at `Bind`.
+    pub fn with_bind_formats(mut self, formats: Option<Vec<FormatCode>>) -> Self {
+        self.bind_formats = formats;
+        self
+    }
+
     /// `Some(columns)` once a `RowDescription` was seen, `Some(empty)` after
     /// `NoData`.
     pub fn described(&self) -> Option<&[ColumnDesc]> {
@@ -106,6 +126,14 @@ impl ResponseCollector {
             backend_tag::ROW_DESCRIPTION => {
                 self.columns = decode_row_description(frame)?;
                 self.described = true;
+                if let Some(formats) = &self.bind_formats
+                    && formats.contains(&FormatCode::Binary)
+                    && self.columns.iter().all(|c| c.format == FormatCode::Text)
+                {
+                    for (i, c) in self.columns.iter_mut().enumerate() {
+                        c.format = broadcast_format(formats, i);
+                    }
+                }
             }
             backend_tag::NO_DATA => {
                 self.columns.clear();
@@ -121,7 +149,13 @@ impl ResponseCollector {
                         .map(|(i, v)| {
                             let (name, oid, fmt) = match self.columns.get(i) {
                                 Some(c) => (c.name.clone(), c.type_oid, c.format),
-                                None => (format!("col{i}"), 0, crate::messages::FormatCode::Text),
+                                None => (
+                                    format!("col{i}"),
+                                    0,
+                                    self.bind_formats
+                                        .as_deref()
+                                        .map_or(FormatCode::Text, |f| broadcast_format(f, i)),
+                                ),
                             };
                             (name, render_value(v.as_deref(), fmt, oid))
                         })
@@ -156,7 +190,29 @@ impl ResponseCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::Frame;
     use crate::messages::build;
+
+    #[test]
+    fn statement_descriptions_take_their_formats_from_bind() {
+        // `Describe` of a statement reports text for every column; the rows
+        // that follow use the binary format the `Bind` asked for.
+        let mut c = ResponseCollector::new().with_bind_formats(Some(vec![FormatCode::Binary]));
+        for f in [
+            build::row_description(&[("stock", 23)]),
+            Frame::new(b'D', {
+                let mut b = bytes::BytesMut::new();
+                b.extend_from_slice(&1i16.to_be_bytes());
+                b.extend_from_slice(&4i32.to_be_bytes());
+                b.extend_from_slice(&7i32.to_be_bytes());
+                b.freeze()
+            }),
+            build::command_complete("SELECT 1"),
+        ] {
+            c.observe(&f).unwrap();
+        }
+        assert_eq!(c.finish().summary(), "returns 7");
+    }
 
     #[test]
     fn collects_rows_tags_and_status() {

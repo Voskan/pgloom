@@ -10,8 +10,11 @@ use crate::text::ReportContext;
 #[derive(Debug, Serialize)]
 pub struct JsonReport {
     pub scenario: String,
-    /// `pass` or `violation`.
+    /// `pass`, `violation`, or `interrupted` (stopped by Ctrl+C before any
+    /// violation was found).
     pub result: &'static str,
+    /// Ctrl+C stopped the exploration early.
+    pub interrupted: bool,
     pub strategy: String,
     pub schedules_explored: usize,
     /// Schedules abandoned by partial-order reduction as redundant.
@@ -45,9 +48,11 @@ pub fn json_report(ctx: &ReportContext, report: &RunReport) -> JsonReport {
     JsonReport {
         scenario: ctx.scenario.clone(),
         result: match report.outcome {
+            RunOutcome::Pass if report.interrupted => "interrupted",
             RunOutcome::Pass => "pass",
             RunOutcome::ViolationFound => "violation",
         },
+        interrupted: report.interrupted,
         strategy: ctx.strategy.clone(),
         schedules_explored: report.stats.schedules,
         schedules_pruned: report.stats.pruned,

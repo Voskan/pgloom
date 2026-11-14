@@ -9,16 +9,17 @@ use std::sync::Arc;
 use pgloom_driver::{Config, ReductionName, ScenarioWorkload, StrategyName, proxied_env};
 use pgloom_engine::coordinator::pg::{PgDbControl, ResetStrategy};
 use pgloom_engine::{
-    Coordinator, CoordinatorConfig, EpisodeResult, Reduction, RunReport, ScheduleExplorer,
-    SchemaModel, Strategy, WorkerId,
+    Coordinator, CoordinatorConfig, EpisodeResult, Reduction, RunControl, RunReport,
+    ScheduleExplorer, SchemaModel, Strategy, WorkerId,
 };
 use pgloom_pgctrl::{PgControl, PgUrl, Snapshot, SnapshotOptions, SqlInvariant};
 use pgloom_wire::{ProxyConfig, ProxyHandle, spawn_proxy};
 use tracing::{debug, warn};
 
 use crate::error::CliError;
+use crate::interrupt;
 use crate::oracle::ScenarioOracle;
-use crate::target::{TargetProcess, wait_http};
+use crate::target::{TargetProcess, answers, wait_http};
 
 /// Command-line overrides of the scenario file.
 #[derive(Debug, Clone, Default)]
@@ -111,7 +112,7 @@ pub struct Session {
     ctl: PgControl,
     snapshot: bool,
     reduction: Reduction,
-    target: Option<TargetProcess>,
+    target: std::sync::Mutex<Option<TargetProcess>>,
     coordinator: Coordinator<ScenarioWorkload, PgDbControl, ScenarioOracle>,
 }
 
@@ -123,6 +124,13 @@ impl Session {
     /// services that migrate on startup create tables PgLoom must restore
     /// between schedules and reason about for partial-order reduction.
     pub async fn start(config: Config, options: RunOptions) -> Result<Self, CliError> {
+        tokio::select! {
+            session = Self::prepare(config, options) => session,
+            () = interrupt::wait() => Err(CliError::Interrupted),
+        }
+    }
+
+    async fn prepare(config: Config, options: RunOptions) -> Result<Self, CliError> {
         let upstream = PgUrl::parse(&config.database.upstream)
             .map_err(|e| CliError::Config(format!("database.upstream: {e}")))?;
         let url = config.database.upstream.as_str();
@@ -165,6 +173,16 @@ impl Session {
 
         let mut target = None;
         if let Some(t) = &config.target {
+            if let (Some(_), Some(ready)) = (&t.command, &t.ready_http)
+                && answers(ready).await
+            {
+                return Err(CliError::Environment(format!(
+                    "{ready} already answers before target.command was started: another \
+                     instance of the service (or another program) is listening there and \
+                     would receive the workers' requests instead. Stop it, or remove \
+                     target.command to test the service that is already running"
+                )));
+            }
             if let Some(cmd) = &t.command {
                 let env = proxied_env(&t.env, &proxy_url);
                 target = Some(TargetProcess::spawn(cmd, &env, t.workdir.as_deref())?);
@@ -232,7 +250,7 @@ impl Session {
             ctl,
             snapshot,
             reduction,
-            target,
+            target: std::sync::Mutex::new(target),
             coordinator,
         })
     }
@@ -293,14 +311,76 @@ impl Session {
         self.upstream.redacted()
     }
 
-    /// Explores schedules as configured.
+    /// Stop requests and live progress of [`Session::run`].
+    pub fn control(&self) -> Arc<RunControl> {
+        self.coordinator.control()
+    }
+
+    /// Explores schedules as configured. Ctrl+C ends the exploration after
+    /// the schedule in progress, with the database restored.
     pub async fn run(&self) -> Result<RunReport, CliError> {
         let explorer = ScheduleExplorer::new(
             strategy_of(&self.config),
             self.config.exploration.max_schedules,
         )
         .with_reduction(self.reduction);
-        Ok(self.coordinator.run(explorer).await?)
+        let control = self.coordinator.control();
+        let watcher = tokio::spawn(async move {
+            interrupt::wait().await;
+            control.request_stop();
+        });
+        let report = self.coordinator.run(explorer).await;
+        watcher.abort();
+        let report = report?;
+        self.check_target().await?;
+        if report.turns == 0 && !report.interrupted {
+            return Err(self.no_traffic());
+        }
+        Ok(report)
+    }
+
+    /// A target that exits mid-run leaves the workers talking to nothing,
+    /// so whatever was explored cannot be trusted.
+    async fn check_target(&self) -> Result<(), CliError> {
+        let exited = {
+            let mut guard = self
+                .target
+                .lock()
+                .map_err(|_| CliError::Internal("target state poisoned".into()))?;
+            guard
+                .as_mut()
+                .and_then(|t| t.exit_status().map(|s| (s, t.log_handle())))
+        };
+        match exited {
+            Some((status, log)) => {
+                let tail = log.lock().await.join("\n");
+                let output = if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!("\ntarget output:\n{tail}")
+                };
+                Err(CliError::Environment(format!(
+                    "the target service exited with {status} during the run, so the explored \
+                     schedules are not reliable{output}"
+                )))
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Without a single turn through the proxy nothing was explored, and a
+    /// pass would be meaningless.
+    fn no_traffic(&self) -> CliError {
+        let proxy = self.proxy_addr().map_or_else(
+            || self.config.database.proxy_listen.clone(),
+            |a| a.to_string(),
+        );
+        CliError::Config(format!(
+            "no SQL from the workers reached the PgLoom proxy on {proxy}, so nothing was \
+             explored. Point the service's DATABASE_URL at the proxy (target.env sets it for a \
+             service PgLoom starts), and make sure no other instance of the service answers \
+             the worker URLs"
+        ))
     }
 
     /// Re-executes recorded choices. Decisions that are no longer possible
@@ -315,12 +395,21 @@ impl Session {
             1,
         );
         explorer.next_schedule();
-        Ok(self.coordinator.run_episode(&mut explorer).await?)
+        let episode = self.coordinator.run_episode(&mut explorer).await?;
+        self.check_target().await?;
+        if episode.record.turns() == 0 {
+            return Err(self.no_traffic());
+        }
+        Ok(episode)
     }
 
     /// Stops the target and the proxy and drops the snapshot schema.
     pub async fn close(mut self) {
-        if let Some(t) = self.target.take() {
+        let target = match self.target.get_mut() {
+            Ok(t) => t.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(t) = target {
             t.stop().await;
         }
         if let Some(p) = self.proxy.take() {
