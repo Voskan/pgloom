@@ -204,11 +204,10 @@ impl PgControl {
                        WHERE l.pid = a.pid AND l.locktype = 'advisory' AND l.granted \
                      ) \
                      OR EXISTS ( \
-                       SELECT 1 FROM pg_stat_get_backend_idset() AS b(id) \
-                       JOIN pg_namespace n ON n.nspname = 'pg_temp_' || b.id::text \
-                       JOIN pg_class c ON c.relnamespace = n.oid \
-                       WHERE pg_stat_get_backend_pid(b.id) = a.pid \
-                         AND c.relpersistence = 't' \
+                       SELECT 1 FROM pg_class c \
+                       JOIN pg_namespace n ON n.oid = c.relnamespace \
+                       WHERE c.relpersistence = 't' \
+                         AND pg_is_other_temp_schema(n.oid) \
                      ) \
                    ) \
                  ORDER BY a.pid",

@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-25
+
+### Fixed
+
+- Detect leaked session-scoped temporary tables via `pg_is_other_temp_schema`
+  instead of `pg_stat_get_backend_idset` slot numbers, which are dense rather
+  than equal to `BackendId` on PostgreSQL 12 through 16 once earlier sessions
+  disconnect.
+
 ## [0.1.3] - 2026-11-25
 
 ### Fixed
@@ -185,7 +194,8 @@ First public release.
 - Commands `run`, `replay`, `demo`, `init` and `doctor`; text and JSON
   reports; `.pgloom-repro.json` files.
 
-[Unreleased]: https://github.com/Voskan/pgloom/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/Voskan/pgloom/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/Voskan/pgloom/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Voskan/pgloom/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Voskan/pgloom/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Voskan/pgloom/compare/v0.1.0...v0.1.1

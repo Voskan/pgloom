@@ -702,9 +702,31 @@ async fn terminate_open_transactions_cleans_leaked_advisory_locks_and_temp_table
     };
     let ctl = PgControl::connect(db.url()).await.unwrap();
 
+    // Open and close sessions first to leave gaps in PostgreSQL 12-16
+    // BackendId slots before allocating temp_holder's pg_temp_<N> namespace.
+    let hole1 = session(db.url()).await;
+    let hole2 = session(db.url()).await;
+    let hole1_pid: i32 = hole1
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let hole2_pid: i32 = hole2
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    hole1.batch_execute("BEGIN").await.unwrap();
+    hole2.batch_execute("BEGIN").await.unwrap();
     let lock_holder = session(db.url()).await;
     let temp_holder = session(db.url()).await;
     let clean_holder = session(db.url()).await;
+    ctl.terminate_open_transactions(&[hole1_pid, hole2_pid])
+        .await
+        .unwrap();
+    drop(hole1);
+    drop(hole2);
+
     let lock_pid: i32 = lock_holder
         .query_one("SELECT pg_backend_pid()", &[])
         .await
@@ -721,8 +743,17 @@ async fn terminate_open_transactions_cleans_leaked_advisory_locks_and_temp_table
         .unwrap()
         .get(0);
 
+    // Clean connection before any temp table exists must not be flagged.
+    clean_holder.batch_execute("SELECT 1").await.unwrap();
+    assert!(
+        ctl.backends_in_transaction(&[clean_pid])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
     // Both dirty statements commit immediately (idle connections, no open
-    // transaction), while clean_holder remains an innocent pooled connection.
+    // transaction), leaving session-scoped state behind.
     lock_holder
         .batch_execute("SELECT pg_advisory_lock(77)")
         .await
@@ -731,10 +762,9 @@ async fn terminate_open_transactions_cleans_leaked_advisory_locks_and_temp_table
         .batch_execute("CREATE TEMP TABLE leaked_scratch (x INT)")
         .await
         .unwrap();
-    clean_holder.batch_execute("SELECT 1").await.unwrap();
 
     let dirty = ctl
-        .backends_in_transaction(&[lock_pid, temp_pid, clean_pid])
+        .backends_in_transaction(&[lock_pid, temp_pid])
         .await
         .unwrap();
     assert!(
@@ -745,17 +775,21 @@ async fn terminate_open_transactions_cleans_leaked_advisory_locks_and_temp_table
         dirty.contains(&temp_pid),
         "temp table owner must be detected: {dirty:?}"
     );
-    assert!(
-        !dirty.contains(&clean_pid),
-        "clean idle connection must not be flagged by another session's temp table: {dirty:?}"
-    );
 
     let terminated = ctl
-        .terminate_open_transactions(&[lock_pid, temp_pid, clean_pid])
+        .terminate_open_transactions(&[lock_pid, temp_pid])
         .await
         .unwrap();
     assert_eq!(terminated.len(), 2);
-    assert!(!terminated.contains(&clean_pid));
+
+    // Once the leaked temp-table session is gone, clean pooled connections are
+    // left untouched.
+    assert!(
+        ctl.backends_in_transaction(&[clean_pid])
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let still_alive: i32 = clean_holder
         .query_one("SELECT 1", &[])
         .await
