@@ -60,13 +60,19 @@ pub async fn doctor(args: DoctorArgs, printer: Printer) -> Result<u8, CliError> 
     let mut checks = Vec::new();
     let mut upstream = args.connection.upstream.clone();
     let mut listen = args.connection.listen.clone();
+    let mut has_reset_sql = false;
     if args.config.exists() {
-        match Config::load(&args.config) {
+        match Config::load_with_overrides(
+            &args.config,
+            args.connection.upstream.as_deref(),
+            args.connection.listen.as_deref(),
+        ) {
             Ok(loaded) => {
                 checks.push(pass(
                     "scenario",
                     format!("{} is valid", args.config.display()),
                 ));
+                has_reset_sql = loaded.config.database.reset_sql.is_some();
                 upstream = upstream.or(Some(loaded.config.database.upstream));
                 listen = listen.or(Some(loaded.config.database.proxy_listen));
             }
@@ -88,7 +94,7 @@ pub async fn doctor(args: DoctorArgs, printer: Printer) -> Result<u8, CliError> 
             "database",
             "no scenario file and no --upstream / PGLOOM_UPSTREAM_URL given",
         )),
-        Some(url) => database_checks(&url, &mut checks).await,
+        Some(url) => database_checks(&url, has_reset_sql, &mut checks).await,
     }
 
     let mut failed = false;
@@ -108,7 +114,7 @@ pub async fn doctor(args: DoctorArgs, printer: Printer) -> Result<u8, CliError> 
     Ok(if failed { EXIT_CONFIG } else { EXIT_PASS })
 }
 
-async fn database_checks(url: &str, checks: &mut Vec<Check>) {
+async fn database_checks(url: &str, has_reset_sql: bool, checks: &mut Vec<Check>) {
     let redacted = PgUrl::parse(url).map_or_else(|_| url.to_owned(), |u| u.redacted());
     let ctl = match PgControl::connect(url).await {
         Ok(c) => c,
@@ -167,18 +173,25 @@ async fn database_checks(url: &str, checks: &mut Vec<Check>) {
         Err(e) => checks.push(fail("cancel/terminate", e)),
     }
 
-    match bool_query(
-        &ctl,
-        "SELECT has_database_privilege(current_database(), 'CREATE')",
-    )
-    .await
-    {
-        Ok(true) => checks.push(pass("snapshot schema", "may create _pgloom_snap")),
-        Ok(false) => checks.push(fail(
+    if has_reset_sql {
+        checks.push(pass(
             "snapshot schema",
-            "CREATE on the database is required for the _pgloom_snap schema (or set reset_sql)",
-        )),
-        Err(e) => checks.push(fail("snapshot schema", e)),
+            "not needed (database.reset_sql is set)",
+        ));
+    } else {
+        match bool_query(
+            &ctl,
+            "SELECT has_database_privilege(current_database(), 'CREATE')",
+        )
+        .await
+        {
+            Ok(true) => checks.push(pass("snapshot schema", "may create _pgloom_snap")),
+            Ok(false) => checks.push(fail(
+                "snapshot schema",
+                "CREATE on the database is required for the _pgloom_snap schema (or set reset_sql)",
+            )),
+            Err(e) => checks.push(fail("snapshot schema", e)),
+        }
     }
 
     let samples = 10;

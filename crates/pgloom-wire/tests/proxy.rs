@@ -842,3 +842,386 @@ async fn real_postgres_tokio_postgres_copy_in_and_copy_out_under_gate() {
     drop(ctl);
     let _ = timeout(STEP, conn_task).await;
 }
+
+#[tokio::test]
+async fn execute_flush_portal_chunks_complete_under_gate() {
+    use bytes::BytesMut;
+    use pgloom_wire::error::Peer;
+    use pgloom_wire::frame::encode_startup;
+    use pgloom_wire::io::FrameReader;
+    use pgloom_wire::messages::{backend_tag, build, tag};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let (rd, mut wr) = sock.into_split();
+        let mut reader = FrameReader::new(rd, Peer::Client);
+        let _ = reader.next_startup().await.unwrap().unwrap();
+
+        let mut init = BytesMut::new();
+        build::authentication_ok().encode(&mut init);
+        build::backend_key_data(5300, 11).encode(&mut init);
+        build::ready_for_query(TxStatus::Idle).encode(&mut init);
+        wr.write_all(&init).await.unwrap();
+
+        // Chunk 1: Parse + Bind + Execute(max_rows = 1) + Flush -> PortalSuspended
+        for expected in [tag::PARSE, tag::BIND, tag::EXECUTE, tag::FLUSH] {
+            let f = reader.next().await.unwrap().unwrap();
+            assert_eq!(f.tag, expected);
+        }
+        let mut resp = BytesMut::new();
+        build::parse_complete().encode(&mut resp);
+        build::bind_complete().encode(&mut resp);
+        build::row_description(&[("balance", 20)]).encode(&mut resp);
+        build::data_row(&[Some("100")]).encode(&mut resp);
+        build::portal_suspended().encode(&mut resp);
+        wr.write_all(&resp).await.unwrap();
+
+        // Chunk 2: Execute(max_rows = 1) + Sync -> CommandComplete + ReadyForQuery
+        for expected in [tag::EXECUTE, tag::SYNC] {
+            let f = reader.next().await.unwrap().unwrap();
+            assert_eq!(f.tag, expected);
+        }
+        let mut resp = BytesMut::new();
+        build::data_row(&[Some("50")]).encode(&mut resp);
+        build::command_complete("SELECT 1").encode(&mut resp);
+        build::ready_for_query(TxStatus::Idle).encode(&mut resp);
+        wr.write_all(&resp).await.unwrap();
+
+        let term = reader.next().await.unwrap().unwrap();
+        assert_eq!(term.tag, tag::TERMINATE);
+    });
+
+    let proxy = spawn_proxy(ProxyConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        upstream: upstream_addr.to_string(),
+    })
+    .await
+    .unwrap();
+    let mut ctl = Controller::new(proxy.gate().open_episode());
+
+    let client = tokio::spawn({
+        let addr = proxy.local_addr();
+        async move {
+            let sock = TcpStream::connect(addr).await.unwrap();
+            let (rd, mut wr) = sock.into_split();
+            let mut reader = FrameReader::new(rd, Peer::Server);
+            wr.write_all(&encode_startup(&[("user", "test"), ("database", "test")]))
+                .await
+                .unwrap();
+            loop {
+                if reader.next().await.unwrap().unwrap().tag == backend_tag::READY_FOR_QUERY {
+                    break;
+                }
+            }
+
+            let mut chunk1 = BytesMut::new();
+            build::parse("s1", "SELECT balance FROM wallets", &[]).encode(&mut chunk1);
+            build::bind("p1", "s1", &[]).encode(&mut chunk1);
+            build::execute("p1", 1).encode(&mut chunk1);
+            build::flush().encode(&mut chunk1);
+            wr.write_all(&chunk1).await.unwrap();
+
+            loop {
+                let f = reader.next().await.unwrap().unwrap();
+                if f.tag == backend_tag::PORTAL_SUSPENDED {
+                    break;
+                }
+            }
+
+            let mut chunk2 = BytesMut::new();
+            build::execute("p1", 1).encode(&mut chunk2);
+            build::sync().encode(&mut chunk2);
+            wr.write_all(&chunk2).await.unwrap();
+            loop {
+                if reader.next().await.unwrap().unwrap().tag == backend_tag::READY_FOR_QUERY {
+                    break;
+                }
+            }
+            wr.write_all(&build::terminate().to_bytes()).await.unwrap();
+        }
+    });
+
+    let (_info1, resp1) = ctl.step(1).await;
+    assert_eq!(resp1.summary(), "returns 100");
+    let (_info2, resp2) = ctl.step(1).await;
+    assert_eq!(resp2.summary(), "returns 50");
+
+    timeout(STEP, client).await.unwrap().unwrap();
+    timeout(STEP, server).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn parse_describe_bind_flush_does_not_leak_bind_complete() {
+    use bytes::BytesMut;
+    use pgloom_wire::error::Peer;
+    use pgloom_wire::frame::encode_startup;
+    use pgloom_wire::io::FrameReader;
+    use pgloom_wire::messages::{backend_tag, build, tag};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let (rd, mut wr) = sock.into_split();
+        let mut reader = FrameReader::new(rd, Peer::Client);
+        let _ = reader.next_startup().await.unwrap().unwrap();
+
+        let mut init = BytesMut::new();
+        build::authentication_ok().encode(&mut init);
+        build::backend_key_data(5301, 12).encode(&mut init);
+        build::ready_for_query(TxStatus::Idle).encode(&mut init);
+        wr.write_all(&init).await.unwrap();
+
+        // Batch 1: Parse + Describe(S) + Bind(binary) + Flush
+        for expected in [tag::PARSE, tag::DESCRIBE, tag::BIND, tag::FLUSH] {
+            let f = reader.next().await.unwrap().unwrap();
+            assert_eq!(f.tag, expected);
+        }
+        let mut resp = BytesMut::new();
+        build::parse_complete().encode(&mut resp);
+        build::parameter_description(&[23]).encode(&mut resp);
+        build::row_description(&[("balance", 20)]).encode(&mut resp);
+        build::bind_complete().encode(&mut resp);
+        wr.write_all(&resp).await.unwrap();
+
+        // Batch 2: Execute(p1) + Sync
+        for expected in [tag::EXECUTE, tag::SYNC] {
+            let f = reader.next().await.unwrap().unwrap();
+            assert_eq!(f.tag, expected);
+        }
+        let mut resp = BytesMut::new();
+        binary_data_row(&[&777i64.to_be_bytes()]).encode(&mut resp);
+        build::command_complete("SELECT 1").encode(&mut resp);
+        build::ready_for_query(TxStatus::Idle).encode(&mut resp);
+        wr.write_all(&resp).await.unwrap();
+
+        let term = reader.next().await.unwrap().unwrap();
+        assert_eq!(term.tag, tag::TERMINATE);
+    });
+
+    let proxy = spawn_proxy(ProxyConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        upstream: upstream_addr.to_string(),
+    })
+    .await
+    .unwrap();
+    let mut ctl = Controller::new(proxy.gate().open_episode());
+
+    let client = tokio::spawn({
+        let addr = proxy.local_addr();
+        async move {
+            let sock = TcpStream::connect(addr).await.unwrap();
+            let (rd, mut wr) = sock.into_split();
+            let mut reader = FrameReader::new(rd, Peer::Server);
+            wr.write_all(&encode_startup(&[("user", "test"), ("database", "test")]))
+                .await
+                .unwrap();
+            loop {
+                if reader.next().await.unwrap().unwrap().tag == backend_tag::READY_FOR_QUERY {
+                    break;
+                }
+            }
+
+            let mut b1 = BytesMut::new();
+            build::parse("s1", "SELECT balance FROM wallets WHERE id = $1", &[23]).encode(&mut b1);
+            build::describe_statement("s1").encode(&mut b1);
+            bind_with_result_formats("p1", "s1", &[Some(b"1")], &[1]).encode(&mut b1);
+            build::flush().encode(&mut b1);
+            wr.write_all(&b1).await.unwrap();
+            for expected in [
+                backend_tag::PARSE_COMPLETE,
+                backend_tag::PARAMETER_DESCRIPTION,
+                backend_tag::ROW_DESCRIPTION,
+                backend_tag::BIND_COMPLETE,
+            ] {
+                let f = reader.next().await.unwrap().unwrap();
+                assert_eq!(f.tag, expected);
+            }
+
+            let mut b2 = BytesMut::new();
+            build::execute("p1", 0).encode(&mut b2);
+            build::sync().encode(&mut b2);
+            wr.write_all(&b2).await.unwrap();
+            loop {
+                if reader.next().await.unwrap().unwrap().tag == backend_tag::READY_FOR_QUERY {
+                    break;
+                }
+            }
+            wr.write_all(&build::terminate().to_bytes()).await.unwrap();
+        }
+    });
+
+    let (_info, resp) = ctl.step(1).await;
+    assert_eq!(resp.summary(), "returns 777");
+
+    timeout(STEP, client).await.unwrap().unwrap();
+    timeout(STEP, server).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn discard_all_and_failed_parse_keep_statement_registry_synchronized() {
+    use bytes::BytesMut;
+    use pgloom_wire::error::Peer;
+    use pgloom_wire::frame::encode_startup;
+    use pgloom_wire::io::FrameReader;
+    use pgloom_wire::messages::{backend_tag, build, tag};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let (rd, mut wr) = sock.into_split();
+        let mut reader = FrameReader::new(rd, Peer::Client);
+        let _ = reader.next_startup().await.unwrap().unwrap();
+
+        let mut init = BytesMut::new();
+        build::authentication_ok().encode(&mut init);
+        build::backend_key_data(5302, 13).encode(&mut init);
+        build::ready_for_query(TxStatus::Idle).encode(&mut init);
+        wr.write_all(&init).await.unwrap();
+
+        // 1. Parse("s1", valid) + Sync -> ParseComplete + ReadyForQuery
+        for expected in [tag::PARSE, tag::SYNC] {
+            assert_eq!(reader.next().await.unwrap().unwrap().tag, expected);
+        }
+        let mut r = BytesMut::new();
+        build::parse_complete().encode(&mut r);
+        build::ready_for_query(TxStatus::Idle).encode(&mut r);
+        wr.write_all(&r).await.unwrap();
+
+        // 2. Parse("s1", invalid) + Sync -> ErrorResponse + ReadyForQuery
+        for expected in [tag::PARSE, tag::SYNC] {
+            assert_eq!(reader.next().await.unwrap().unwrap().tag, expected);
+        }
+        let mut r = BytesMut::new();
+        build::error_response("42601", "syntax error").encode(&mut r);
+        build::ready_for_query(TxStatus::Idle).encode(&mut r);
+        wr.write_all(&r).await.unwrap();
+
+        // 3. Bind("", "s1") + Execute + Sync -> succeeds with original s1
+        for expected in [tag::BIND, tag::EXECUTE, tag::SYNC] {
+            assert_eq!(reader.next().await.unwrap().unwrap().tag, expected);
+        }
+        let mut r = BytesMut::new();
+        build::bind_complete().encode(&mut r);
+        build::row_description(&[("balance", 20)]).encode(&mut r);
+        build::data_row(&[Some("100")]).encode(&mut r);
+        build::command_complete("SELECT 1").encode(&mut r);
+        build::ready_for_query(TxStatus::Idle).encode(&mut r);
+        wr.write_all(&r).await.unwrap();
+
+        // 4. DISCARD ALL (noise)
+        assert_eq!(reader.next().await.unwrap().unwrap().tag, tag::QUERY);
+        let mut r = BytesMut::new();
+        build::command_complete("DISCARD ALL").encode(&mut r);
+        build::ready_for_query(TxStatus::Idle).encode(&mut r);
+        wr.write_all(&r).await.unwrap();
+
+        // 5. Bind("", "s1") + Execute + Sync after DISCARD ALL
+        for expected in [tag::BIND, tag::EXECUTE, tag::SYNC] {
+            assert_eq!(reader.next().await.unwrap().unwrap().tag, expected);
+        }
+        let mut r = BytesMut::new();
+        build::error_response("26000", "prepared statement \"s1\" does not exist").encode(&mut r);
+        build::ready_for_query(TxStatus::Idle).encode(&mut r);
+        wr.write_all(&r).await.unwrap();
+
+        assert_eq!(reader.next().await.unwrap().unwrap().tag, tag::TERMINATE);
+    });
+
+    let proxy = spawn_proxy(ProxyConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        upstream: upstream_addr.to_string(),
+    })
+    .await
+    .unwrap();
+    let mut ctl = Controller::new(proxy.gate().open_episode());
+
+    let client = tokio::spawn({
+        let addr = proxy.local_addr();
+        async move {
+            let sock = TcpStream::connect(addr).await.unwrap();
+            let (rd, mut wr) = sock.into_split();
+            let mut reader = FrameReader::new(rd, Peer::Server);
+            wr.write_all(&encode_startup(&[("user", "test"), ("database", "test")]))
+                .await
+                .unwrap();
+            async fn drain_rfq(reader: &mut FrameReader<tokio::net::tcp::OwnedReadHalf>) {
+                loop {
+                    if reader.next().await.unwrap().unwrap().tag == backend_tag::READY_FOR_QUERY {
+                        break;
+                    }
+                }
+            }
+            drain_rfq(&mut reader).await;
+
+            // 1. Valid Parse("s1")
+            let mut m = BytesMut::new();
+            build::parse("s1", "SELECT balance FROM wallets WHERE id = $1", &[23]).encode(&mut m);
+            build::sync().encode(&mut m);
+            wr.write_all(&m).await.unwrap();
+            drain_rfq(&mut reader).await;
+
+            // 2. Failed Parse("s1")
+            let mut m = BytesMut::new();
+            build::parse("s1", "INVALID SYNTAX", &[]).encode(&mut m);
+            build::sync().encode(&mut m);
+            wr.write_all(&m).await.unwrap();
+            drain_rfq(&mut reader).await;
+
+            // 3. Execute("s1") -> must still resolve original SQL
+            let mut m = BytesMut::new();
+            build::bind("", "s1", &[Some(b"1")]).encode(&mut m);
+            build::execute("", 0).encode(&mut m);
+            build::sync().encode(&mut m);
+            wr.write_all(&m).await.unwrap();
+            drain_rfq(&mut reader).await;
+
+            // 4. DISCARD ALL
+            wr.write_all(&build::query("DISCARD ALL").to_bytes())
+                .await
+                .unwrap();
+            drain_rfq(&mut reader).await;
+
+            // 5. Execute("s1") after DISCARD ALL -> unknown statement
+            let mut m = BytesMut::new();
+            build::bind("", "s1", &[Some(b"1")]).encode(&mut m);
+            build::execute("", 0).encode(&mut m);
+            build::sync().encode(&mut m);
+            wr.write_all(&m).await.unwrap();
+            drain_rfq(&mut reader).await;
+
+            wr.write_all(&build::terminate().to_bytes()).await.unwrap();
+        }
+    });
+
+    let (info1, resp1) = ctl.step(1).await;
+    assert_eq!(
+        info1.statements[0].sql, "SELECT balance FROM wallets WHERE id = $1",
+        "failed Parse must roll back to the previous statement definition"
+    );
+    assert_eq!(resp1.summary(), "returns 100");
+
+    let (info2, _resp2) = ctl.step(1).await;
+    assert!(
+        info2.statements[0]
+            .sql
+            .contains("unknown prepared statement"),
+        "DISCARD ALL must evict cached statements, got: {}",
+        info2.statements[0].sql
+    );
+
+    timeout(STEP, client).await.unwrap().unwrap();
+    timeout(STEP, server).await.unwrap().unwrap();
+}

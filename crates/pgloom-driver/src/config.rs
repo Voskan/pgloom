@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::env::interpolate;
+use crate::env::{interpolate, interpolate_lenient, missing_vars_error};
+use crate::invariants::cmp_json_numbers;
 
 pub const DEFAULT_PROXY_LISTEN: &str = "127.0.0.1:15432";
 
@@ -85,6 +86,10 @@ pub struct TargetConfig {
     /// Polled until it answers 2xx before exploration starts.
     #[serde(default)]
     pub ready_http: Option<String>,
+    /// Optional HTTP endpoint invoked via POST after each schedule reset to
+    /// clear in-process caches or state held by the target service.
+    #[serde(default)]
+    pub reset_http: Option<String>,
     #[serde(default = "default_startup_timeout")]
     pub startup_timeout_ms: u64,
 }
@@ -353,14 +358,49 @@ pub struct LoadedConfig {
     pub source: String,
 }
 
+impl LoadedConfig {
+    /// Returns `true` when `database.upstream` in the raw YAML source embeds a
+    /// literal password instead of referencing an environment variable.
+    pub fn upstream_has_literal_password(&self) -> bool {
+        #[derive(Deserialize)]
+        struct Raw {
+            database: RawDb,
+        }
+        #[derive(Deserialize)]
+        struct RawDb {
+            upstream: String,
+        }
+        let Ok(raw) = serde_saphyr::from_str::<Raw>(&self.source) else {
+            return false;
+        };
+        if raw.database.upstream.contains("${") {
+            return false;
+        }
+        pgloom_pgctrl::PgUrl::parse(&raw.database.upstream)
+            .is_ok_and(|u| u.redacted() != u.to_string())
+    }
+}
+
 impl Config {
     /// Reads, interpolates, parses and validates a scenario file.
     pub fn load(path: &Path) -> Result<LoadedConfig, ConfigError> {
+        Self::load_with_overrides(path, None, None)
+    }
+
+    /// Reads, interpolates, parses and validates a scenario file, allowing
+    /// explicit CLI `--upstream` / `--listen` values to supersede unset
+    /// `${VAR}` placeholders in `database.upstream` or `database.proxy_listen`.
+    pub fn load_with_overrides(
+        path: &Path,
+        upstream: Option<&str>,
+        listen: Option<&str>,
+    ) -> Result<LoadedConfig, ConfigError> {
         let source = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.to_owned(),
             source,
         })?;
-        let mut config = Self::parse(&source, &path.display().to_string())?;
+        let mut config =
+            Self::parse_with_overrides(&source, &path.display().to_string(), upstream, listen)?;
         config.resolve_paths(path.parent().unwrap_or(Path::new("")));
         Ok(LoadedConfig {
             config,
@@ -399,6 +439,24 @@ impl Config {
         Self::parse_with_env(source, origin, |k| std::env::var(k).ok())
     }
 
+    /// Like [`Config::parse`], but applies `upstream` / `listen` overrides
+    /// before failing on unset `${VAR}` references that appeared only inside
+    /// `database.upstream` or `database.proxy_listen`.
+    pub fn parse_with_overrides(
+        source: &str,
+        origin: &str,
+        upstream: Option<&str>,
+        listen: Option<&str>,
+    ) -> Result<Self, ConfigError> {
+        Self::parse_with_env_and_overrides(
+            source,
+            origin,
+            |k| std::env::var(k).ok(),
+            upstream,
+            listen,
+        )
+    }
+
     pub fn parse_with_env(
         source: &str,
         origin: &str,
@@ -409,6 +467,67 @@ impl Config {
             path: origin.to_owned(),
             message: e.to_string(),
         })?;
+        let problems = config.problems();
+        if !problems.is_empty() {
+            return Err(ConfigError::Invalid {
+                path: origin.to_owned(),
+                problems,
+            });
+        }
+        Ok(config)
+    }
+
+    pub fn parse_with_env_and_overrides(
+        source: &str,
+        origin: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+        upstream: Option<&str>,
+        listen: Option<&str>,
+    ) -> Result<Self, ConfigError> {
+        if upstream.is_none() && listen.is_none() {
+            return Self::parse_with_env(source, origin, lookup);
+        }
+        let mut prefix = "__PGLOOM_UNSET_".to_owned();
+        while source.contains(&prefix) {
+            prefix.push('X');
+        }
+        let mut sentinels: Vec<(String, String)> = Vec::new();
+        let (text, missing) = interpolate_lenient(source, lookup, |name| {
+            if let Some((tok, _)) = sentinels.iter().find(|(_, n)| n == name) {
+                return tok.clone();
+            }
+            let tok = format!("{prefix}{}__", sentinels.len());
+            sentinels.push((tok.clone(), name.to_owned()));
+            tok
+        })
+        .map_err(ConfigError::Env)?;
+        let mut config: Config = serde_saphyr::from_str(&text).map_err(|e| {
+            if !missing.is_empty() {
+                ConfigError::Env(missing_vars_error(&missing))
+            } else {
+                ConfigError::Yaml {
+                    path: origin.to_owned(),
+                    message: e.to_string(),
+                }
+            }
+        })?;
+        if let Some(u) = upstream {
+            config.database.upstream = u.to_owned();
+        }
+        if let Some(l) = listen {
+            config.database.proxy_listen = l.to_owned();
+        }
+        if !sentinels.is_empty() {
+            let serialized = serde_json::to_string(&config).unwrap_or_default();
+            let remaining: Vec<String> = sentinels
+                .into_iter()
+                .filter(|(tok, _)| serialized.contains(tok))
+                .map(|(_, name)| name)
+                .collect();
+            if !remaining.is_empty() {
+                return Err(ConfigError::Env(missing_vars_error(&remaining)));
+            }
+        }
         let problems = config.problems();
         if !problems.is_empty() {
             return Err(ConfigError::Invalid {
@@ -528,6 +647,13 @@ impl Config {
                     "target.ready_http: expected an http:// URL, got `{url}`"
                 ));
             }
+            if let Some(url) = &t.reset_http
+                && !url.starts_with("http://")
+            {
+                p.push(format!(
+                    "target.reset_http: expected an http:// URL, got `{url}`"
+                ));
+            }
         }
         let mut names = BTreeSet::new();
         for inv in &self.invariants.sql {
@@ -568,7 +694,7 @@ impl Config {
                     ));
                 }
                 if let (Some(lo), Some(hi)) = (&check.min, &check.max)
-                    && lo.as_f64() > hi.as_f64()
+                    && cmp_json_numbers(lo, hi) == Some(std::cmp::Ordering::Greater)
                 {
                     p.push(format!("{at}: json[{i}].min exceeds max"));
                 }
@@ -902,5 +1028,95 @@ workers:
             Config::load(&dir.path().join("missing.yaml")),
             Err(ConfigError::Read { .. })
         ));
+    }
+
+    #[test]
+    fn cli_overrides_supersede_unset_upstream_and_listen_env_vars() {
+        let src = r#"
+version: 1
+name: ci-override
+database:
+  upstream: "${UNSET_CI_DB_URL}"
+  proxy_listen: "${UNSET_LISTEN_ADDR}"
+workers:
+  - id: a
+    sql: ["SELECT 1"]
+  - id: b
+    sql: ["SELECT 1"]
+"#;
+        // Without overrides, missing vars fail as before.
+        assert!(matches!(
+            Config::parse_with_env(src, "pgloom.yaml", no_env),
+            Err(ConfigError::Env(_))
+        ));
+        // With CLI overrides, unset vars in overridden fields do not block parsing.
+        let cfg = Config::parse_with_env_and_overrides(
+            src,
+            "pgloom.yaml",
+            no_env,
+            Some("postgres://postgres:postgres@127.0.0.1:5432/postgres"),
+            Some("127.0.0.1:15432"),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.database.upstream,
+            "postgres://postgres:postgres@127.0.0.1:5432/postgres"
+        );
+        assert_eq!(cfg.database.proxy_listen, "127.0.0.1:15432");
+
+        // An unset variable in a non-overridden field still fails naming it.
+        let with_other = format!("{src}target:\n  env:\n    API_KEY: \"${{UNSET_API_KEY}}\"\n");
+        let err = Config::parse_with_env_and_overrides(
+            &with_other,
+            "pgloom.yaml",
+            no_env,
+            Some("postgres://postgres:postgres@127.0.0.1:5432/postgres"),
+            Some("127.0.0.1:15432"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UNSET_API_KEY"), "{err}");
+    }
+
+    #[test]
+    fn target_reset_http_is_parsed_and_validated() {
+        let src =
+            format!("{TWO_HTTP}target:\n  reset_http: http://127.0.0.1:8080/internal/reset\n");
+        let cfg = Config::parse_with_env(&src, "x", no_env).unwrap();
+        assert_eq!(
+            cfg.target.unwrap().reset_http.as_deref(),
+            Some("http://127.0.0.1:8080/internal/reset")
+        );
+
+        let bad =
+            format!("{TWO_HTTP}target:\n  reset_http: https://127.0.0.1:8080/internal/reset\n");
+        let err = Config::parse_with_env(&bad, "x", no_env).unwrap_err();
+        assert!(err.to_string().contains("target.reset_http"), "{err}");
+    }
+
+    #[test]
+    fn upstream_has_literal_password_distinguishes_env_vars_from_literals() {
+        let dir = tempfile::tempdir().unwrap();
+        let with_env = dir.path().join("env.yaml");
+        std::fs::write(&with_env, EXAMPLE).unwrap();
+        assert!(
+            !Config::load(&with_env)
+                .unwrap()
+                .upstream_has_literal_password()
+        );
+
+        let with_literal = dir.path().join("lit.yaml");
+        std::fs::write(
+            &with_literal,
+            EXAMPLE.replace(
+                "${PGLOOM_UPSTREAM_URL:-postgres://postgres:postgres@127.0.0.1:5432/app_test}",
+                "postgres://app:supersecret@127.0.0.1:5432/app_test",
+            ),
+        )
+        .unwrap();
+        assert!(
+            Config::load(&with_literal)
+                .unwrap()
+                .upstream_has_literal_password()
+        );
     }
 }

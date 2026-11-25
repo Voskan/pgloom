@@ -46,6 +46,7 @@ pub mod backend_tag {
     pub const COPY_DONE: u8 = b'c';
     pub const PARSE_COMPLETE: u8 = b'1';
     pub const BIND_COMPLETE: u8 = b'2';
+    pub const CLOSE_COMPLETE: u8 = b'3';
     pub const PORTAL_SUSPENDED: u8 = b's';
     pub const PARAMETER_DESCRIPTION: u8 = b't';
     pub const NO_DATA: u8 = b'n';
@@ -634,6 +635,23 @@ pub mod build {
 
     pub fn bind_complete() -> Frame {
         Frame::new(backend_tag::BIND_COMPLETE, Bytes::new())
+    }
+
+    pub fn close_complete() -> Frame {
+        Frame::new(backend_tag::CLOSE_COMPLETE, Bytes::new())
+    }
+
+    pub fn portal_suspended() -> Frame {
+        Frame::new(backend_tag::PORTAL_SUSPENDED, Bytes::new())
+    }
+
+    pub fn parameter_description(oids: &[u32]) -> Frame {
+        let mut b = BytesMut::with_capacity(2 + 4 * oids.len());
+        b.put_i16(oids.len() as i16);
+        for oid in oids {
+            b.put_u32(*oid);
+        }
+        Frame::new(backend_tag::PARAMETER_DESCRIPTION, b.freeze())
     }
 
     pub fn no_data() -> Frame {

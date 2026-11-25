@@ -45,7 +45,7 @@ where
     let mut attempts = 0;
     let mut improvements = 0;
     'outer: loop {
-        if best.preemptions() == 0 {
+        if best.preemptions() == 0 && best.context_switches() <= 1 {
             break;
         }
         for candidate in candidates(&best) {

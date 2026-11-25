@@ -13,6 +13,7 @@ use tokio::process::Command;
 use crate::cli::DemoArgs;
 use crate::commands::run::{plan_line, report_context};
 use crate::error::{CliError, EXIT_PASS};
+use crate::interrupt;
 use crate::output::Printer;
 use crate::session::{RunOptions, Session};
 use crate::wallet::{WalletMode, WalletServer};
@@ -95,12 +96,25 @@ struct DemoDatabase {
 }
 
 impl DemoDatabase {
-    async fn stop(self) {
-        if let Some(id) = self.container {
+    async fn stop(mut self) {
+        if let Some(id) = self.container.take() {
             let _ = Command::new("docker")
                 .args(["stop", "-t", "1", &id])
                 .output()
                 .await;
+        }
+    }
+}
+
+impl Drop for DemoDatabase {
+    fn drop(&mut self) {
+        if let Some(id) = self.container.take() {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &id])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
         }
     }
 }
@@ -159,7 +173,7 @@ async fn find_database(
         )));
     }
     let id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    let db = DemoDatabase {
+    let mut db = DemoDatabase {
         url: String::new(),
         container: Some(id.clone()),
     };
@@ -192,10 +206,8 @@ async fn find_database(
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    Ok(DemoDatabase {
-        url,
-        container: Some(id),
-    })
+    db.url = url;
+    Ok(db)
 }
 
 async fn act(
@@ -225,7 +237,10 @@ pub async fn demo(args: DemoArgs, printer: Printer) -> Result<u8, CliError> {
         "{}\n  A wallet service holding $100 receives two concurrent $100 withdrawals.\n",
         banner("PgLoom demo: the classic READ COMMITTED double spend")
     ));
-    let db = find_database(args.upstream, &printer).await?;
+    let db = tokio::select! {
+        db = find_database(args.upstream, &printer) => db?,
+        () = interrupt::wait() => return Err(CliError::Interrupted),
+    };
     let result = run_acts(&db.url, &printer).await;
     if let Ok(ctl) = PgControl::connect(&db.url).await {
         let _ = ctl

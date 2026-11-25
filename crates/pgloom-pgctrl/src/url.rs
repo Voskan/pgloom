@@ -89,7 +89,19 @@ impl PgUrl {
         };
         let mut params: Vec<String> = query
             .split('&')
-            .filter(|kv| !kv.is_empty() && !kv.starts_with("sslmode="))
+            .filter(|kv| {
+                if kv.is_empty() {
+                    return false;
+                }
+                let key = kv.split_once('=').map_or(*kv, |(k, _)| k);
+                !key.eq_ignore_ascii_case("sslmode")
+                    && !key.eq_ignore_ascii_case("channel_binding")
+                    && !key.eq_ignore_ascii_case("sslrootcert")
+                    && !key.eq_ignore_ascii_case("sslcert")
+                    && !key.eq_ignore_ascii_case("sslkey")
+                    && !key.eq_ignore_ascii_case("sslpassword")
+                    && !key.eq_ignore_ascii_case("sslsni")
+            })
             .map(str::to_owned)
             .collect();
         params.push("sslmode=disable".into());
@@ -162,5 +174,20 @@ mod tests {
         ] {
             assert!(PgUrl::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn with_ssl_disabled_strips_channel_binding_and_mixed_case_ssl_params() {
+        let u = PgUrl::parse(
+            "postgres://u:p@ep.neon.tech/db?SSLMODE=verify-full&Channel_Binding=require&\
+             sslrootcert=/etc/ca.pem&sslcert=/c.pem&sslkey=/k.pem&sslpassword=pw&sslsni=1&\
+             application_name=wallet",
+        )
+        .unwrap();
+        let proxied = u.with_host_port("127.0.0.1", 15432).with_ssl_disabled();
+        assert_eq!(
+            proxied.to_string(),
+            "postgres://u:p@127.0.0.1:15432/db?application_name=wallet&sslmode=disable"
+        );
     }
 }

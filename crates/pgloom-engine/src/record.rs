@@ -183,7 +183,15 @@ pub struct EpisodeRecord {
     pub dirty_tables: BTreeSet<String>,
     /// A write whose targets could not be determined was observed.
     pub opaque_writes: bool,
+    /// Turns forwarded unsupervised because no worker slot was free (e.g.
+    /// concurrent connections per worker or background service tasks).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unsupervised_turns: usize,
     pub deadlock: Option<Violation>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl EpisodeRecord {

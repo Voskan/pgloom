@@ -13,7 +13,12 @@ use crate::session::{Overrides, RunOptions, Session};
 pub async fn replay(args: ReplayArgs, printer: Printer) -> Result<u8, CliError> {
     let repro = ReproFile::load(&args.repro)?;
     // The embedded scenario is authoritative: the schedule refers to its workers.
-    let mut config = Config::parse(&repro.config_source, &repro.config_path)?;
+    let mut config = Config::parse_with_overrides(
+        &repro.config_source,
+        &repro.config_path,
+        args.connection.upstream.as_deref(),
+        args.connection.listen.as_deref(),
+    )?;
     let scenario = locate_scenario(&repro.config_path, &args.repro);
     config.resolve_paths(match &scenario {
         Some(path) => path.parent().unwrap_or(Path::new("")),

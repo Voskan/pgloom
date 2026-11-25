@@ -113,13 +113,16 @@ fn check_bodies(
         }
     }
     if let Some(ptr) = &inv.distinct {
-        let values: Vec<(&str, &Value)> = documents
-            .iter()
-            .filter_map(|(id, doc)| doc.pointer(ptr).map(|v| (*id, v)))
-            .collect();
+        let mut values: Vec<(&str, &Value)> = Vec::new();
+        for (id, doc) in &documents {
+            match doc.pointer(ptr) {
+                Some(v) => values.push((*id, v)),
+                None => failures.push(format!("{id}: {} is missing", pointer_label(ptr))),
+            }
+        }
         let duplicated: Vec<String> = values
             .iter()
-            .filter(|(_, v)| values.iter().filter(|(_, w)| w == v).count() > 1)
+            .filter(|(_, v)| values.iter().filter(|(_, w)| json_eq(w, v)).count() > 1)
             .map(|(id, v)| format!("{id}={v}"))
             .collect();
         if !duplicated.is_empty() {
@@ -167,33 +170,70 @@ fn check_field(check: &JsonCheck, value: Option<&Value>) -> Option<String> {
         return Some(format!("{name} = {value}, expected one of [{list}]"));
     }
     if check.min.is_some() || check.max.is_some() {
-        let Some(n) = value.as_f64() else {
+        let Value::Number(n) = value else {
             return Some(format!("{name} = {value}, expected a number"));
         };
-        if let Some(min) = check.min.as_ref().and_then(serde_json::Number::as_f64)
-            && n < min
+        if let Some(min) = &check.min
+            && cmp_json_numbers(n, min) == Some(std::cmp::Ordering::Less)
         {
-            return Some(format!(
-                "{name} = {value}, expected >= {}",
-                check.min.as_ref()?
-            ));
+            return Some(format!("{name} = {value}, expected >= {min}"));
         }
-        if let Some(max) = check.max.as_ref().and_then(serde_json::Number::as_f64)
-            && n > max
+        if let Some(max) = &check.max
+            && cmp_json_numbers(n, max) == Some(std::cmp::Ordering::Greater)
         {
-            return Some(format!(
-                "{name} = {value}, expected <= {}",
-                check.max.as_ref()?
-            ));
+            return Some(format!("{name} = {value}, expected <= {max}"));
         }
     }
     None
 }
 
-/// Equality that treats `1` and `1.0` as the same number.
+fn as_exact_i128(n: &serde_json::Number) -> Option<i128> {
+    n.as_i64()
+        .map(i128::from)
+        .or_else(|| n.as_u64().map(i128::from))
+}
+
+fn cmp_i128_f64(x: i128, y: f64) -> std::cmp::Ordering {
+    if y >= 170_141_183_460_469_231_731_687_303_715_884_105_728.0_f64 {
+        return std::cmp::Ordering::Less;
+    }
+    if y < -170_141_183_460_469_231_731_687_303_715_884_105_728.0_f64 {
+        return std::cmp::Ordering::Greater;
+    }
+    let trunc = y.trunc();
+    #[allow(clippy::cast_possible_truncation)]
+    let yi = trunc as i128;
+    match x.cmp(&yi) {
+        std::cmp::Ordering::Equal => 0.0_f64.total_cmp(&(y - trunc)),
+        other => other,
+    }
+}
+
+/// Exact comparison for JSON numbers, preserving full 64-bit integer precision
+/// instead of silently rounding `i64`/`u64` values through `f64`.
+pub(crate) fn cmp_json_numbers(
+    a: &serde_json::Number,
+    b: &serde_json::Number,
+) -> Option<std::cmp::Ordering> {
+    if let (Some(x), Some(y)) = (as_exact_i128(a), as_exact_i128(b)) {
+        return Some(x.cmp(&y));
+    }
+    if let (Some(x), Some(yf)) = (as_exact_i128(a), b.as_f64()) {
+        return Some(cmp_i128_f64(x, yf));
+    }
+    if let (Some(xf), Some(y)) = (a.as_f64(), as_exact_i128(b)) {
+        return Some(cmp_i128_f64(y, xf).reverse());
+    }
+    a.as_f64()?.partial_cmp(&b.as_f64()?)
+}
+
+/// Equality that treats `1` and `1.0` as the same number while preserving full
+/// 64-bit integer precision.
 fn json_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => x == y || x.as_f64() == y.as_f64(),
+        (Value::Number(x), Value::Number(y)) => {
+            x == y || cmp_json_numbers(x, y) == Some(std::cmp::Ordering::Equal)
+        }
         _ => a == b,
     }
 }
@@ -426,6 +466,80 @@ mod tests {
         assert!(
             matches!(&v[0], Violation::InvariantFailed { description, .. }
                 if description == "expected <= 1 successful workers, got 2 (a=ok, b=ok)")
+        );
+    }
+
+    #[test]
+    fn distinct_fails_when_pointer_is_missing() {
+        let mut i = inv(None, None, None);
+        i.distinct = Some("/balance".into());
+        let v = check_responses(
+            &[i],
+            &ab(),
+            &[
+                json(200, r#"{"balance": 100}"#),
+                json(200, r#"{"ok": true}"#),
+            ],
+        );
+        assert_eq!(failure(&v), "req_b: /balance is missing");
+    }
+
+    #[test]
+    fn json_numbers_compare_64bit_integers_precisely() {
+        let a = i64::MAX - 1;
+        let b = i64::MAX;
+
+        // equals distinguishes i64::MAX - 1 from i64::MAX.
+        let mut eq_inv = inv(None, None, None);
+        eq_inv.json = vec![JsonCheck {
+            equals: Some(b.into()),
+            ..check("/id")
+        }];
+        let v = check_responses(
+            &[eq_inv],
+            &ab(),
+            &[
+                json(200, &format!(r#"{{"id": {a}}}"#)),
+                json(200, &format!(r#"{{"id": {b}}}"#)),
+            ],
+        );
+        assert!(
+            failure(&v).contains(&format!("req_a: /id = {a}, expected {b}")),
+            "{v:?}"
+        );
+
+        // min rejects i64::MAX - 1 when min = i64::MAX.
+        let mut min_inv = inv(None, None, None);
+        min_inv.json = vec![JsonCheck {
+            min: Some(b.into()),
+            ..check("/id")
+        }];
+        let v = check_responses(
+            &[min_inv],
+            &ab(),
+            &[
+                json(200, &format!(r#"{{"id": {a}}}"#)),
+                json(200, &format!(r#"{{"id": {b}}}"#)),
+            ],
+        );
+        assert!(
+            failure(&v).contains(&format!("req_a: /id = {a}, expected >= {b}")),
+            "{v:?}"
+        );
+
+        // distinct recognizes i64::MAX - 1 and i64::MAX as distinct values.
+        let mut dist_inv = inv(None, None, None);
+        dist_inv.distinct = Some("/id".into());
+        assert!(
+            check_responses(
+                &[dist_inv],
+                &ab(),
+                &[
+                    json(200, &format!(r#"{{"id": {a}}}"#)),
+                    json(200, &format!(r#"{{"id": {b}}}"#)),
+                ],
+            )
+            .is_empty()
         );
     }
 }

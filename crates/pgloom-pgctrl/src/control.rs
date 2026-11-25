@@ -180,7 +180,8 @@ impl PgControl {
         Ok(out)
     }
 
-    /// Backends among `pids` that currently have an open transaction.
+    /// Backends among `pids` that still hold an open transaction, a granted
+    /// session-level advisory lock, or session-scoped temporary tables.
     pub async fn backends_in_transaction(&self, pids: &[i32]) -> PgCtrlResult<Vec<i32>> {
         if pids.is_empty() {
             return Ok(Vec::new());
@@ -190,11 +191,27 @@ impl PgControl {
             .client
             .query(
                 // Aborted transactions report a NULL xact_start but still
-                // occupy the session until ROLLBACK.
-                "SELECT pid FROM pg_stat_activity \
-                 WHERE pid = ANY($1::int4[]) \
-                   AND (xact_start IS NOT NULL OR state LIKE 'idle in transaction%') \
-                 ORDER BY pid",
+                // occupy the session until ROLLBACK. Session-level advisory
+                // locks and temp tables survive COMMIT on idle pooled
+                // connections and would leak into the next schedule.
+                "SELECT a.pid FROM pg_stat_activity a \
+                 WHERE a.pid = ANY($1::int4[]) \
+                   AND ( \
+                     a.xact_start IS NOT NULL \
+                     OR a.state LIKE 'idle in transaction%' \
+                     OR EXISTS ( \
+                       SELECT 1 FROM pg_locks l \
+                       WHERE l.pid = a.pid AND l.locktype = 'advisory' AND l.granted \
+                     ) \
+                     OR EXISTS ( \
+                       SELECT 1 FROM pg_stat_get_backend_idset() AS b(id) \
+                       JOIN pg_namespace n ON n.nspname = 'pg_temp_' || b.id::text \
+                       JOIN pg_class c ON c.relnamespace = n.oid \
+                       WHERE pg_stat_get_backend_pid(b.id) = a.pid \
+                         AND c.relpersistence = 't' \
+                     ) \
+                   ) \
+                 ORDER BY a.pid",
                 &[&pids],
             )
             .await

@@ -1,10 +1,10 @@
 //! Fix Advisor: maps a failing trace to a known concurrency anti-pattern and
 //! concrete remediations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pgloom_engine::{EpisodeRecord, StepAction, Violation, WorkerId};
-use pgloom_wire::classify_sql;
+use pgloom_wire::{RowLock, TxControl, classify_sql};
 use serde::Serialize;
 
 use crate::style::one_line;
@@ -45,32 +45,79 @@ pub struct Advice {
     pub fixes: Vec<Fix>,
 }
 
-/// Statements a worker executed, in order, with their bind parameters.
+/// Statements a worker executed within one transaction (or autocommit sequence),
+/// in order, with their bind parameters.
 struct Trace<'a> {
     sql: Vec<&'a str>,
     params: Vec<&'a [String]>,
 }
 
-fn traces(record: &EpisodeRecord) -> BTreeMap<WorkerId, Trace<'_>> {
-    let mut out: BTreeMap<WorkerId, Trace<'_>> = BTreeMap::new();
+/// Splits each worker's executed statements into per-transaction traces so a
+/// read in one committed transaction is never paired with a write in a later
+/// transaction. Autocommit workers remain in a single trace.
+fn traces(record: &EpisodeRecord) -> Vec<(WorkerId, Trace<'_>)> {
+    let mut by_worker: BTreeMap<WorkerId, Vec<Trace<'_>>> = BTreeMap::new();
     for step in &record.steps {
-        if matches!(
+        if !matches!(
             step.action,
             StepAction::Execute | StepAction::Begin | StepAction::Park { .. }
-        ) && !step.sql.is_empty()
+        ) || step.sql.is_empty()
         {
-            let t = out.entry(step.worker).or_insert_with(|| Trace {
+            continue;
+        }
+        let meta = classify_sql(&step.sql);
+        let list = by_worker.entry(step.worker).or_default();
+        if meta.is_begin_only() {
+            if list.last().is_none_or(|t| !t.sql.is_empty()) {
+                list.push(Trace {
+                    sql: Vec::new(),
+                    params: Vec::new(),
+                });
+            }
+            if let Some(t) = list.last_mut() {
+                t.sql.push(&step.sql);
+                t.params.push(&step.params);
+            }
+            continue;
+        }
+        if list.is_empty() {
+            list.push(Trace {
                 sql: Vec::new(),
                 params: Vec::new(),
             });
+        }
+        if let Some(t) = list.last_mut() {
             t.sql.push(&step.sql);
             t.params.push(&step.params);
         }
+        if meta.tx_controls().any(TxControl::ends_transaction) {
+            list.push(Trace {
+                sql: Vec::new(),
+                params: Vec::new(),
+            });
+        }
     }
-    out
+    by_worker
+        .into_iter()
+        .flat_map(|(w, ts)| {
+            ts.into_iter()
+                .filter(|t| !t.sql.is_empty())
+                .map(move |t| (w, t))
+        })
+        .collect()
 }
 
-/// A read of `table` without a row lock, followed by a write to it.
+/// True when `lock` prevents concurrent updates to the read row.
+/// Shared locks (`FOR SHARE`, `FOR KEY SHARE`) still allow two transactions
+/// to read concurrently and then collide or deadlock on `UPDATE`.
+fn is_exclusive_row_lock(lock: Option<RowLock>) -> bool {
+    matches!(
+        lock,
+        Some(RowLock::ForUpdate | RowLock::ForNoKeyUpdate | RowLock::Advisory | RowLock::Table)
+    )
+}
+
+/// A read of `table` without an exclusive row lock, followed by a write to it.
 #[derive(Debug)]
 struct ReadThenWrite<'a> {
     table: String,
@@ -85,7 +132,7 @@ struct ReadThenWrite<'a> {
 fn read_then_write<'a>(trace: &Trace<'a>) -> Option<ReadThenWrite<'a>> {
     for (i, read) in trace.sql.iter().enumerate() {
         let meta = classify_sql(read);
-        if meta.has_write() || meta.row_lock().is_some() {
+        if meta.has_write() || is_exclusive_row_lock(meta.row_lock()) {
             continue;
         }
         for table in meta.read_tables() {
@@ -102,7 +149,7 @@ fn read_then_write<'a>(trace: &Trace<'a>) -> Option<ReadThenWrite<'a>> {
                 let parent = trace.sql[..j].iter().copied().find(|r| {
                     let m = classify_sql(r);
                     !m.has_write()
-                        && m.row_lock().is_none()
+                        && !is_exclusive_row_lock(m.row_lock())
                         && !is_aggregate_read(r)
                         && !m.read_tables().is_empty()
                         && m.read_tables().iter().all(|t| !written.contains(t))
@@ -138,10 +185,16 @@ pub fn advise(record: &EpisodeRecord, violations: &[Violation], names: &[String]
     }
 
     let traces = traces(record);
-    let found: Vec<(WorkerId, ReadThenWrite<'_>)> = traces
-        .iter()
-        .filter_map(|(w, t)| read_then_write(t).map(|rw| (*w, rw)))
-        .collect();
+    let mut found: Vec<(WorkerId, ReadThenWrite<'_>)> = Vec::new();
+    let mut seen_workers: BTreeSet<WorkerId> = BTreeSet::new();
+    for (w, t) in &traces {
+        if !seen_workers.contains(w)
+            && let Some(rw) = read_then_write(t)
+        {
+            seen_workers.insert(*w);
+            found.push((*w, rw));
+        }
+    }
     let Some((_, first)) = found.first() else {
         return out;
     };
@@ -161,14 +214,20 @@ pub fn advise(record: &EpisodeRecord, violations: &[Violation], names: &[String]
 
     if first_keyword(first.write) == "INSERT" {
         let (insert_body, returning) = split_returning(&write);
-        let on_conflict = match returning {
-            Some(ret) => format!("{insert_body} ON CONFLICT DO NOTHING {ret};"),
-            None => format!("{insert_body} ON CONFLICT DO NOTHING;"),
+        let on_conflict = if find_top_level(insert_body, " on conflict ").is_some() {
+            format!("{write};")
+        } else {
+            match returning {
+                Some(ret) => format!("{insert_body} ON CONFLICT DO NOTHING {ret};"),
+                None => format!("{insert_body} ON CONFLICT DO NOTHING;"),
+            }
         };
         let mut fixes = Vec::new();
-        if let Some(parent) = first.parent {
-            let parent = clean_sql(parent).trim_end_matches(';').to_owned();
-            let parent_table = classify_sql(&parent)
+        if let Some(parent) = first.parent
+            && let Some(locked_parent) = safe_lock_read(parent)
+        {
+            let parent_clean = clean_sql(parent).trim_end_matches(';').to_owned();
+            let parent_table = classify_sql(&parent_clean)
                 .read_tables()
                 .into_iter()
                 .next()
@@ -176,9 +235,10 @@ pub fn advise(record: &EpisodeRecord, violations: &[Violation], names: &[String]
             fixes.push(Fix {
                 title: "Fix Option A (Lock the parent row first):".into(),
                 sql: vec![
-                    format!("{parent} FOR NO KEY UPDATE;"),
+                    locked_parent,
                     format!(
-                        "-- checks and inserts for the same `{parent_table}` row now run one at a time."),
+                        "-- checks and inserts for the same `{parent_table}` row now run one at a time."
+                    ),
                 ],
             });
         }
@@ -269,11 +329,7 @@ pub fn advise(record: &EpisodeRecord, violations: &[Violation], names: &[String]
                 .into(),
         );
     }
-    let lock = if is_aggregate_read(&read) {
-        lock_rows_read(&read)
-    } else {
-        Some(format!("{read} FOR NO KEY UPDATE;"))
-    };
+    let lock = safe_lock_read(&read);
     let mut fixes = Vec::new();
     if let Some(lock) = lock {
         fixes.push(Fix {
@@ -286,7 +342,7 @@ pub fn advise(record: &EpisodeRecord, violations: &[Violation], names: &[String]
             ],
         });
     }
-    match (lost, atomic_update(first.write)) {
+    match (lost, atomic_update(first.write, &read)) {
         (true, Some((increment, compare_and_set, col))) => {
             fixes.push(Fix {
                 title: format!("Fix Option {} (Atomic Update):", option(fixes.len())),
@@ -367,18 +423,154 @@ fn is_aggregate_read(sql: &str) -> bool {
         || find_top_level(&flat, " having ").is_some()
 }
 
-/// Rewrites a read into one that locks every row it looked at:
-/// `SELECT count(*) FROM t WHERE p` becomes `SELECT 1 FROM t WHERE p FOR NO
-/// KEY UPDATE;`. Returns `None` for set operations, which cannot be locked.
-fn lock_rows_read(sql: &str) -> Option<String> {
+fn has_set_operation(flat: &str) -> bool {
+    [" union ", " intersect ", " except "]
+        .iter()
+        .any(|op| find_top_level(flat, op).is_some())
+}
+
+fn has_window_function(flat: &str) -> bool {
+    find_top_level(flat, " over(").is_some()
+        || find_top_level(flat, " over ").is_some()
+        || find_top_level(flat, " window ").is_some()
+}
+
+fn has_outer_join(flat: &str) -> bool {
+    find_top_level(flat, " left join ").is_some()
+        || find_top_level(flat, " left outer join ").is_some()
+        || find_top_level(flat, " right join ").is_some()
+        || find_top_level(flat, " right outer join ").is_some()
+        || find_top_level(flat, " full join ").is_some()
+        || find_top_level(flat, " full outer join ").is_some()
+}
+
+fn has_right_or_full_join(flat: &str) -> bool {
+    find_top_level(flat, " right join ").is_some()
+        || find_top_level(flat, " right outer join ").is_some()
+        || find_top_level(flat, " full join ").is_some()
+        || find_top_level(flat, " full outer join ").is_some()
+}
+
+/// Strips a trailing `FOR [KEY] SHARE [OF ...] [NOWAIT|SKIP LOCKED]` clause so
+/// a shared-lock read can be upgraded cleanly to `FOR NO KEY UPDATE`.
+fn strip_trailing_shared_lock(flat: &str) -> &str {
+    for needle in [" for key share", " for share"] {
+        if let Some(pos) = find_top_level(flat, needle) {
+            return flat[..pos].trim_end();
+        }
+    }
+    flat
+}
+
+/// Extracts the lockable target name (alias if present, else table name) of the
+/// first relation after `FROM`, used for `FOR NO KEY UPDATE OF <target>` on
+/// `LEFT JOIN` queries where PostgreSQL rejects locking the nullable side.
+fn first_from_target(flat: &str) -> Option<String> {
+    let from = find_top_level(flat, " from ")?;
+    let mut rest = flat[from + 6..].trim_start();
+    if let Some(after_only) = rest
+        .get(..5)
+        .filter(|p| p.eq_ignore_ascii_case("only "))
+        .map(|_| rest[5..].trim_start())
+    {
+        rest = after_only;
+    }
+    let (table_tok, after_table) = take_sql_ident(rest)?;
+    let mut tail = after_table.trim_start();
+    // Skip schema qualification (`schema.table` -> `table`).
+    let mut target = table_tok;
+    if let Some(after_dot) = tail.strip_prefix('.') {
+        let (rel_tok, after_rel) = take_sql_ident(after_dot.trim_start())?;
+        target = rel_tok;
+        tail = after_rel.trim_start();
+    }
+    if let Some(after_as) = tail
+        .get(..3)
+        .filter(|p| p.eq_ignore_ascii_case("as "))
+        .map(|_| tail[3..].trim_start())
+        && let Some((alias, _)) = take_sql_ident(after_as)
+    {
+        return Some(alias.to_owned());
+    }
+    if let Some((alias, _)) = take_sql_ident(tail) {
+        let lower = alias.to_ascii_lowercase();
+        if !matches!(
+            lower.as_str(),
+            "left"
+                | "right"
+                | "full"
+                | "inner"
+                | "cross"
+                | "join"
+                | "natural"
+                | "where"
+                | "group"
+                | "order"
+                | "limit"
+                | "offset"
+                | "having"
+                | "for"
+                | "on"
+                | "using"
+        ) {
+            return Some(alias.to_owned());
+        }
+    }
+    Some(target.to_owned())
+}
+
+fn take_sql_ident(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let &first = bytes.first()?;
+    if first == b'"' {
+        let end = skip_double_quoted(s, 1);
+        return Some((&s[..end], &s[end..]));
+    }
+    if first.is_ascii_alphabetic() || first == b'_' {
+        let mut i = 1;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        return Some((&s[..i], &s[i..]));
+    }
+    None
+}
+
+/// Builds a syntactically valid PostgreSQL `FOR NO KEY UPDATE` statement for
+/// `sql`, or `None` when PostgreSQL forbids row locks on the query shape
+/// (`WITH`, `UNION`/`INTERSECT`/`EXCEPT`, `RIGHT`/`FULL` outer joins, etc.).
+fn safe_lock_read(sql: &str) -> Option<String> {
     let flat = clean_sql(sql);
-    let flat = flat.trim_end_matches(';');
+    let flat = strip_trailing_shared_lock(flat.trim_end_matches(';'));
     if !flat
         .get(..7)
         .is_some_and(|p| p.eq_ignore_ascii_case("select "))
-        || [" union ", " intersect ", " except "]
-            .iter()
-            .any(|op| find_top_level(flat, op).is_some())
+        || has_set_operation(flat)
+        || has_right_or_full_join(flat)
+    {
+        return None;
+    }
+    if is_aggregate_read(flat) || has_window_function(flat) {
+        return lock_rows_read(flat);
+    }
+    if has_outer_join(flat) {
+        let target = first_from_target(flat)?;
+        return Some(format!("{flat} FOR NO KEY UPDATE OF {target};"));
+    }
+    Some(format!("{flat} FOR NO KEY UPDATE;"))
+}
+
+/// Rewrites a read into one that locks every row it looked at:
+/// `SELECT count(*) FROM t WHERE p` becomes `SELECT 1 FROM t WHERE p FOR NO
+/// KEY UPDATE;`. Returns `None` for shapes PostgreSQL cannot lock.
+fn lock_rows_read(sql: &str) -> Option<String> {
+    let flat = clean_sql(sql);
+    let flat = strip_trailing_shared_lock(flat.trim_end_matches(';'));
+    if !flat
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("select "))
+        || has_set_operation(flat)
+        || has_right_or_full_join(flat)
     {
         return None;
     }
@@ -386,6 +578,7 @@ fn lock_rows_read(sql: &str) -> Option<String> {
     let end = [
         " group by ",
         " having ",
+        " window ",
         " order by ",
         " limit ",
         " offset ",
@@ -394,6 +587,13 @@ fn lock_rows_read(sql: &str) -> Option<String> {
     .filter_map(|k| find_top_level(flat, k))
     .min()
     .unwrap_or(flat.len());
+    if has_outer_join(flat) {
+        let target = first_from_target(flat)?;
+        return Some(format!(
+            "SELECT 1{} FOR NO KEY UPDATE OF {target};",
+            &flat[from..end]
+        ));
+    }
     Some(format!("SELECT 1{} FOR NO KEY UPDATE;", &flat[from..end]))
 }
 
@@ -432,18 +632,82 @@ fn where_reads_params(sql: &str) -> bool {
     })
 }
 
+/// Normalizes a column name for loose matching between `SELECT` and `SET`.
+fn normalize_col(col: &str) -> String {
+    let trimmed = col.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        trimmed[1..trimmed.len() - 1].replace("\"\"", "\"")
+    } else {
+        trimmed.to_ascii_lowercase()
+    }
+}
+
+/// Identifiers appearing in the `SELECT` projection list (before `FROM`).
+fn read_projection_columns(read_sql: &str) -> Vec<String> {
+    let flat = clean_sql(read_sql);
+    let Some(from) = find_top_level(&flat, " from ") else {
+        return Vec::new();
+    };
+    let head = flat[..from].trim();
+    let Some(proj) = head
+        .get(..7)
+        .filter(|p| p.eq_ignore_ascii_case("select "))
+        .map(|_| head[7..].trim())
+    else {
+        return Vec::new();
+    };
+    split_top_level_commas(proj)
+        .into_iter()
+        .filter_map(|item| {
+            let item = item.trim();
+            // Take the expression before any `AS alias`, and strip table prefix.
+            let expr = match find_top_level(item, " as ") {
+                Some(p) => item[..p].trim(),
+                None => item,
+            };
+            let col = expr.rsplit('.').next().unwrap_or(expr).trim();
+            (!col.is_empty() && col != "*").then(|| normalize_col(col))
+        })
+        .collect()
+}
+
 /// For an absolute `SET c = $1 WHERE p`, proposes the in-SQL increment
 /// `SET c = c + <delta> WHERE p` and the compare-and-set
 /// `SET c = $1 WHERE p AND c = <value you read>`.
-fn atomic_update(sql: &str) -> Option<(String, String, String)> {
+///
+/// When `UPDATE` assigns multiple columns (e.g. `balance = $1, status = $2,
+/// updated_at = $3`), only columns present in the preceding `SELECT` list are
+/// rewritten so non-numeric auxiliary columns are not turned into `col + <delta>`.
+fn atomic_update(sql: &str, read_sql: &str) -> Option<(String, String, String)> {
     let u = split_update(sql)?;
     let assigned = assignments(&u.set_clause);
-    let cols: Vec<&str> = assigned.iter().map(|(c, _)| c.as_str()).collect();
+    if assigned.is_empty() {
+        return None;
+    }
+    let read_cols = read_projection_columns(read_sql);
+    let target_indices: Vec<usize> = if assigned.len() == 1 {
+        vec![0]
+    } else {
+        let matched: Vec<usize> = assigned
+            .iter()
+            .enumerate()
+            .filter(|(_, (c, _))| read_cols.contains(&normalize_col(c)))
+            .map(|(i, _)| i)
+            .collect();
+        if matched.is_empty() { vec![0] } else { matched }
+    };
     let increment = SplitUpdate {
         head: u.head.clone(),
-        set_clause: cols
+        set_clause: assigned
             .iter()
-            .map(|c| format!("{c} = {c} + <delta>"))
+            .enumerate()
+            .map(|(i, (c, expr))| {
+                if target_indices.contains(&i) {
+                    format!("{c} = {c} + <delta>")
+                } else {
+                    format!("{c} = {expr}")
+                }
+            })
             .collect::<Vec<_>>()
             .join(", "),
         from_clause: u.from_clause.clone(),
@@ -451,12 +715,12 @@ fn atomic_update(sql: &str) -> Option<(String, String, String)> {
         returning: u.returning.clone(),
     }
     .render(None);
-    let expected = cols
+    let expected = target_indices
         .iter()
-        .map(|c| format!("{c} = <value you read>"))
+        .map(|&i| format!("{} = <value you read>", assigned[i].0))
         .collect::<Vec<_>>()
         .join(" AND ");
-    let first = cols.first()?.to_string();
+    let first = assigned[target_indices[0]].0.clone();
     Some((increment, u.render_with_guard(&expected), first))
 }
 
@@ -489,12 +753,13 @@ fn lock_order(
     }
 }
 
-/// Strips leading SQL comments and collapses the statement onto a single line,
-/// replacing any inline `-- ... \n` comments with spaces so collapsing newlines
-/// never comments out the rest of the statement.
+/// Strips leading and inline SQL comments (`-- ... \n` and nested `/* ... */`)
+/// and collapses the statement onto a single line so collapsing newlines never
+/// comments out the rest of the statement and inline block comments never hide
+/// keywords such as `DISTINCT`.
 fn clean_sql(sql: &str) -> String {
     let s = strip_leading_comments(sql);
-    if !s.contains("--") {
+    if !s.contains("--") && !s.contains("/*") {
         return one_line(s);
     }
     let bytes = s.as_bytes();
@@ -507,6 +772,25 @@ fn clean_sql(sql: &str) -> String {
             i += 2;
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += s[i..].chars().next().map_or(1, char::len_utf8);
+            }
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            stripped.push(' ');
+            let mut cdepth = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    cdepth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    cdepth -= 1;
+                    i += 2;
+                    if cdepth == 0 {
+                        break;
+                    }
+                } else {
+                    i += s[i..].chars().next().map_or(1, char::len_utf8);
+                }
             }
             continue;
         }
@@ -727,6 +1011,14 @@ struct SplitUpdate {
     returning: Option<String>,
 }
 
+fn parenthesize_or(cond: &str) -> String {
+    if find_top_level(cond, " or ").is_some() {
+        format!("({cond})")
+    } else {
+        cond.to_owned()
+    }
+}
+
 impl SplitUpdate {
     fn render_with_guard(&self, guard: &str) -> String {
         self.render(Some(guard))
@@ -738,7 +1030,7 @@ impl SplitUpdate {
             .as_deref()
             .map_or_else(String::new, |f| format!(" {f}"));
         let where_body = match (&self.cond, guard) {
-            (Some(c), Some(g)) => format!(" WHERE {c} AND {g}"),
+            (Some(c), Some(g)) => format!(" WHERE {} AND {g}", parenthesize_or(c)),
             (Some(c), None) => format!(" WHERE {c}"),
             (None, Some(g)) => format!(" WHERE {g}"),
             (None, None) => String::new(),
@@ -795,13 +1087,15 @@ fn append_where_guard(sql: &str, guard: &str) -> String {
         None => {
             let flat = clean_sql(sql);
             let (body, ret) = split_returning(flat.trim_end_matches(';'));
-            let joiner = if find_top_level(body, " WHERE ").is_some() {
-                "AND"
-            } else {
-                "WHERE"
-            };
             let ret = ret.map_or_else(String::new, |r| format!(" {r}"));
-            format!("{body} {joiner} {guard}{ret};")
+            match find_top_level(body, " WHERE ") {
+                Some(w) => {
+                    let prefix = &body[..w];
+                    let cond = body[w + 7..].trim();
+                    format!("{prefix} WHERE {} AND {guard}{ret};", parenthesize_or(cond))
+                }
+                None => format!("{body} WHERE {guard}{ret};"),
+            }
         }
     }
 }
@@ -872,15 +1166,34 @@ fn is_constant(expr: &str) -> bool {
         || matches!(lower.as_str(), "true" | "false" | "null")
 }
 
+fn has_top_level_add_sub(expr: &str) -> bool {
+    top_level_offsets(expr)
+        .into_iter()
+        .any(|i| matches!(expr.as_bytes()[i], b'+' | b'-'))
+}
+
 /// For `SET c = c - x WHERE p [RETURNING ...]`, proposes
-/// `... WHERE p AND c >= x [RETURNING ...]`.
+/// `... WHERE p AND c >= x [RETURNING ...]` when `x` is a single term, or
+/// `... WHERE p AND (c - x - y) >= 0 [RETURNING ...]` when the expression
+/// contains further top-level `+`/`-` terms so signs are never inverted.
 fn guarded_update(sql: &str) -> Option<String> {
     let u = split_update(sql)?;
-    let (col, delta) = assignments(&u.set_clause).into_iter().find_map(|(c, e)| {
-        let (lhs, rhs) = e.split_once('-')?;
-        (lhs.trim() == c).then(|| (c.clone(), rhs.trim().to_owned()))
+    let guard = assignments(&u.set_clause).into_iter().find_map(|(c, e)| {
+        let minus = top_level_offsets(&e)
+            .into_iter()
+            .find(|&i| e.as_bytes()[i] == b'-')?;
+        let lhs = e[..minus].trim();
+        let rhs = e[minus + 1..].trim();
+        if lhs != c || rhs.is_empty() {
+            return None;
+        }
+        if has_top_level_add_sub(rhs) {
+            Some(format!("({}) >= 0", e.trim()))
+        } else {
+            Some(format!("{c} >= {rhs}"))
+        }
     })?;
-    Some(u.render_with_guard(&format!("{col} >= {delta}")))
+    Some(u.render_with_guard(&guard))
 }
 
 #[cfg(test)]
@@ -1227,5 +1540,182 @@ mod tests {
                 .starts_with("SELECT \"balance,usd\" FROM \"public\".\"Wallet\"")
         );
         assert!(advice[0].fixes[1].sql[0].contains("\"balance,usd\" = \"balance,usd\" + <delta>"));
+    }
+
+    #[test]
+    fn or_predicate_is_parenthesized_when_guard_appended() {
+        let r = record(&[
+            (0, "SELECT balance FROM wallets WHERE id = $1"),
+            (
+                0,
+                "UPDATE wallets SET balance = balance - $1 WHERE id = $2 OR ext_id = $3",
+            ),
+        ]);
+        let a = &advise(&r, &[], &names())[0];
+        assert_eq!(
+            a.fixes[1].sql[0],
+            "UPDATE wallets SET balance = balance - $1 WHERE (id = $2 OR ext_id = $3) AND balance >= $1;"
+        );
+        assert_eq!(
+            append_where_guard(
+                "DELETE FROM holds WHERE id = $1 OR owner = $2",
+                "active = true"
+            ),
+            "DELETE FROM holds WHERE (id = $1 OR owner = $2) AND active = true;"
+        );
+    }
+
+    #[test]
+    fn multi_term_subtraction_guards_full_expression() {
+        let r = record(&[
+            (0, "SELECT balance FROM wallets WHERE id = $1"),
+            (
+                0,
+                "UPDATE wallets SET balance = balance - $1 - $2 WHERE id = $3",
+            ),
+        ]);
+        let a = &advise(&r, &[], &names())[0];
+        assert_eq!(
+            a.fixes[1].sql[0],
+            "UPDATE wallets SET balance = balance - $1 - $2 WHERE id = $3 AND (balance - $1 - $2) >= 0;"
+        );
+    }
+
+    #[test]
+    fn multi_column_update_only_rewrites_read_column() {
+        let r = record(&[
+            (0, "SELECT balance FROM wallets WHERE id = $1"),
+            (
+                0,
+                "UPDATE wallets SET balance = $1, status = $2, updated_at = $3 WHERE id = $4",
+            ),
+        ]);
+        let a = &advise(&r, &[], &names())[0];
+        assert_eq!(a.pattern, Pattern::LostUpdate);
+        assert_eq!(
+            a.fixes[1].sql[0],
+            "UPDATE wallets SET balance = balance + <delta>, status = $2, updated_at = $3 WHERE id = $4;"
+        );
+    }
+
+    #[test]
+    fn left_join_uses_for_no_key_update_of_target_table() {
+        let r = record(&[
+            (
+                0,
+                "SELECT w.balance FROM wallets w LEFT JOIN holds h ON h.wallet_id = w.id WHERE w.id = $1",
+            ),
+            (0, "UPDATE wallets SET balance = balance - $1 WHERE id = $2"),
+        ]);
+        let a = &advise(&r, &[], &names())[0];
+        assert!(
+            a.fixes[0].sql[0].ends_with("FOR NO KEY UPDATE OF w;"),
+            "{}",
+            a.fixes[0].sql[0]
+        );
+    }
+
+    #[test]
+    fn union_cte_and_window_reads_do_not_emit_invalid_for_update() {
+        for (read_sql, forbidden_fragment) in [
+            (
+                "SELECT balance FROM wallets WHERE id = $1 UNION SELECT balance FROM archive WHERE id = $1",
+                "UNION",
+            ),
+            (
+                "WITH w AS (SELECT balance FROM wallets WHERE id = $1) SELECT balance FROM w",
+                "WITH ",
+            ),
+            (
+                "SELECT balance, row_number() OVER () FROM wallets WHERE id = $1",
+                "OVER (",
+            ),
+        ] {
+            let r = record(&[
+                (0, read_sql),
+                (0, "UPDATE wallets SET balance = balance - $1 WHERE id = $2"),
+            ]);
+            let advice = advise(&r, &[], &names());
+            for a in &advice {
+                for fix in &a.fixes {
+                    for sql in &fix.sql {
+                        assert!(
+                            !(sql.contains(forbidden_fragment)
+                                && sql.contains("FOR NO KEY UPDATE")),
+                            "invalid FOR NO KEY UPDATE emitted on `{read_sql}`: {sql}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn phantom_insert_does_not_duplicate_on_conflict() {
+        let r = record(&[
+            (0, "SELECT count(*) FROM holds WHERE id = $1"),
+            (
+                0,
+                "INSERT INTO holds (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
+            ),
+        ]);
+        let a = &advise(&r, &[], &names())[0];
+        assert_eq!(a.pattern, Pattern::PhantomInsert);
+        for sql in &a.fixes[0].sql {
+            assert!(
+                sql.matches("ON CONFLICT").count() <= 1,
+                "duplicate ON CONFLICT in: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn for_share_read_then_write_suggests_upgrading_to_exclusive_lock() {
+        let r = record(&[
+            (0, "SELECT balance FROM wallets WHERE id = $1 FOR SHARE"),
+            (0, "UPDATE wallets SET balance = balance - $1 WHERE id = $2"),
+        ]);
+        let a = &advise(&r, &[], &names())[0];
+        assert_eq!(a.pattern, Pattern::CheckThenAct);
+        assert_eq!(
+            a.fixes[0].sql[0],
+            "SELECT balance FROM wallets WHERE id = $1 FOR NO KEY UPDATE;"
+        );
+    }
+
+    #[test]
+    fn separate_transactions_on_same_worker_do_not_cross_commit_boundary() {
+        let r = record(&[
+            (0, "BEGIN"),
+            (0, "SELECT balance FROM wallets WHERE id = $1"),
+            (0, "COMMIT"),
+            (0, "BEGIN"),
+            (0, "UPDATE wallets SET balance = balance - $1 WHERE id = $2"),
+            (0, "COMMIT"),
+        ]);
+        let advice = advise(&r, &[], &names());
+        assert!(
+            advice.is_empty(),
+            "read and write in distinct transactions should not match: {advice:?}"
+        );
+    }
+
+    #[test]
+    fn block_comments_are_stripped_before_rewriting() {
+        let r = record(&[
+            (
+                0,
+                "/* app:read */ SELECT balance FROM wallets WHERE id = $1",
+            ),
+            (
+                0,
+                "/* app:debit */ UPDATE wallets /* nested /* c */ */ SET balance = balance - $1 WHERE id = $2",
+            ),
+        ]);
+        let a = &advise(&r, &[], &names())[0];
+        assert_eq!(
+            a.fixes[1].sql[0],
+            "UPDATE wallets SET balance = balance - $1 WHERE id = $2 AND balance >= $1;"
+        );
     }
 }

@@ -203,15 +203,24 @@ impl ReproFile {
         serde_json::to_string_pretty(self).unwrap_or_default()
     }
 
-    /// Writes atomically (temporary file + rename).
+    /// Writes atomically using a unique temporary file in the target directory.
     pub fn save(&self, path: &Path) -> Result<(), ReproError> {
+        use std::io::Write as _;
+
         let err = |source| ReproError::Write {
             path: path.display().to_string(),
             source,
         };
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, self.to_json() + "\n").map_err(err)?;
-        std::fs::rename(&tmp, path).map_err(err)
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(err)?;
+        tmp.write_all((self.to_json() + "\n").as_bytes())
+            .map_err(err)?;
+        tmp.flush().map_err(err)?;
+        tmp.persist(path).map_err(|e| err(e.error))?;
+        Ok(())
     }
 
     pub fn load(path: &Path) -> Result<Self, ReproError> {

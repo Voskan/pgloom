@@ -218,6 +218,232 @@ pub fn classify_sql(sql: &str) -> TurnMeta {
     meta
 }
 
+/// Session-level prepared-statement mutations expressed in SQL rather than
+/// via extended-protocol `Parse` / `Close` messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSqlOp {
+    /// `DISCARD ALL`, `DISCARD PLANS`, or `DEALLOCATE [PREPARE] ALL`.
+    ClearStatements,
+    /// `DEALLOCATE [PREPARE] <name>`.
+    DeallocateStatement(String),
+    /// `PREPARE <name> [(...)] AS <sql>`.
+    PrepareStatement { name: String, sql: String },
+}
+
+/// Extracts SQL-level `PREPARE`, `DEALLOCATE`, and `DISCARD` operations that
+/// affect the backend's prepared-statement table.
+pub fn session_sql_ops(sql: &str) -> Vec<SessionSqlOp> {
+    let mut ops = Vec::new();
+    for part in split_sql_statements(sql) {
+        let tokens = tokenize(part);
+        let start = tokens
+            .iter()
+            .position(|t| *t != Token::Symbol('('))
+            .unwrap_or(tokens.len());
+        let tokens = &tokens[start..];
+        let Some(first) = tokens.first().and_then(Token::word) else {
+            continue;
+        };
+        match first {
+            "discard" => {
+                if matches!(tokens.get(1).and_then(Token::word), Some("all" | "plans")) {
+                    ops.push(SessionSqlOp::ClearStatements);
+                }
+            }
+            "deallocate" => {
+                let mut i = 1;
+                if tokens.get(i).is_some_and(|t| t.is_word("prepare")) {
+                    i += 1;
+                }
+                if tokens.get(i).is_some_and(|t| t.is_word("all")) {
+                    ops.push(SessionSqlOp::ClearStatements);
+                } else if let Some(name) = tokens.get(i).and_then(Token::ident) {
+                    ops.push(SessionSqlOp::DeallocateStatement(name.to_owned()));
+                }
+            }
+            "prepare" if tokens.get(1).and_then(Token::word) != Some("transaction") => {
+                if let Some((name, body)) = extract_prepare_body(part) {
+                    ops.push(SessionSqlOp::PrepareStatement { name, sql: body });
+                }
+            }
+            _ => {}
+        }
+    }
+    ops
+}
+
+/// Splits `sql` on top-level semicolons (ignoring strings, quoted identifiers,
+/// dollar quotes, and comments).
+fn split_sql_statements(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let n = bytes.len();
+    while i < n {
+        let b = bytes[i];
+        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let mut depth = 0usize;
+            while i < n {
+                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else if b == b'\'' {
+            i = skip_quoted_bytes(bytes, i + 1, b'\'', false);
+        } else if (b == b'e' || b == b'E')
+            && bytes.get(i + 1) == Some(&b'\'')
+            && !i
+                .checked_sub(1)
+                .is_some_and(|p| bytes[p].is_ascii_alphanumeric() || bytes[p] == b'_')
+        {
+            i = skip_quoted_bytes(bytes, i + 2, b'\'', true);
+        } else if b == b'"' {
+            i = skip_quoted_bytes(bytes, i + 1, b'"', false);
+        } else if b == b'$' && !bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            if let Some(end) = skip_dollar_bytes(sql, i) {
+                i = end;
+            } else {
+                i += 1;
+            }
+        } else if b == b';' {
+            out.push(&sql[start..i]);
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if start < n {
+        out.push(&sql[start..]);
+    }
+    out
+}
+
+fn skip_quoted_bytes(bytes: &[u8], mut i: usize, quote: u8, backslash: bool) -> usize {
+    while i < bytes.len() {
+        if backslash && bytes[i] == b'\\' {
+            i = (i + 2).min(bytes.len());
+        } else if bytes[i] == quote {
+            if bytes.get(i + 1) == Some(&quote) {
+                i += 2;
+            } else {
+                return i + 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    i
+}
+
+fn skip_dollar_bytes(sql: &str, start: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut j = start + 1;
+    while j < bytes.len() {
+        let ch = sql[j..].chars().next()?;
+        if ch == '$' {
+            let delim = &sql[start..=j];
+            let body = j + 1;
+            return match sql[body..].find(delim) {
+                Some(rel) => Some(body + rel + delim.len()),
+                None => Some(sql.len()),
+            };
+        }
+        if ch.is_alphanumeric() || ch == '_' {
+            j += ch.len_utf8();
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+/// Extracts `(name, body_sql)` from `PREPARE <name> [(types...)] AS <body_sql>`.
+fn extract_prepare_body(stmt: &str) -> Option<(String, String)> {
+    let tokens = tokenize(stmt);
+    let name = tokens.get(1)?.ident()?.to_owned();
+    let bytes = stmt.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    let n = bytes.len();
+    while i < n {
+        let b = bytes[i];
+        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let mut cdepth = 0usize;
+            while i < n {
+                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    cdepth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    cdepth -= 1;
+                    i += 2;
+                    if cdepth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if b == b'\'' {
+            i = skip_quoted_bytes(bytes, i + 1, b'\'', false);
+            continue;
+        }
+        if b == b'"' {
+            i = skip_quoted_bytes(bytes, i + 1, b'"', false);
+            continue;
+        }
+        match b {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ if depth == 0 && (b.is_ascii_alphabetic() || b == b'_') => {
+                let start = i;
+                while i < n && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                if stmt[start..i].eq_ignore_ascii_case("as") {
+                    let body = stmt[i..].trim();
+                    if !body.is_empty() {
+                        return Some((name, body.to_owned()));
+                    }
+                    return None;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// Whether `sql` contains a top-level `COPY` statement, which enters the
 /// `CopyIn` / `CopyOut` wire subprotocol when executed.
 pub fn is_copy_sql(sql: &str) -> bool {
@@ -407,13 +633,17 @@ fn classify_statement(tokens: &[Token]) -> StatementKind {
         "prepare" if second == Some("transaction") => {
             StatementKind::TransactionControl(TxControl::PrepareTransaction)
         }
-        "prepare" | "set" | "show" | "reset" | "discard" | "deallocate" | "listen" | "unlisten"
-        | "load" | "close" | "fetch" | "move" | "declare" => StatementKind::Noise,
+        "set" => classify_set(tokens),
+        "declare" => classify_declare(tokens),
+        "fetch" | "move" | "notify" => StatementKind::DataWrite {
+            target_tables: Vec::new(),
+            opaque: true,
+        },
+        "prepare" | "show" | "reset" | "discard" | "deallocate" | "listen" | "unlisten"
+        | "load" | "close" => StatementKind::Noise,
         "explain" => classify_explain(tokens),
         "select" | "with" | "values" | "table" => classify_query(tokens),
-        "insert" | "update" | "delete" | "merge" | "truncate" | "copy" | "notify" => {
-            classify_query(tokens)
-        }
+        "insert" | "update" | "delete" | "merge" | "truncate" | "copy" => classify_query(tokens),
         "lock" => StatementKind::DataRead {
             tables: idents_after_lock(tokens),
             row_lock: Some(RowLock::Table),
@@ -422,6 +652,34 @@ fn classify_statement(tokens: &[Token]) -> StatementKind {
             target_tables: Vec::new(),
             opaque: true,
         },
+    }
+}
+
+fn classify_set(tokens: &[Token]) -> StatementKind {
+    let i = skip_words(tokens, 1, &["local", "session"]);
+    match tokens.get(i).and_then(Token::word) {
+        Some("role" | "authorization") => StatementKind::DataWrite {
+            target_tables: Vec::new(),
+            opaque: true,
+        },
+        _ => StatementKind::Noise,
+    }
+}
+
+fn classify_declare(tokens: &[Token]) -> StatementKind {
+    if let Some(cursor_pos) = tokens.iter().position(|t| t.is_word("cursor"))
+        && let Some(rel) = tokens[cursor_pos + 1..]
+            .iter()
+            .position(|t| t.is_word("for"))
+    {
+        let body = &tokens[cursor_pos + 1 + rel + 1..];
+        if !body.is_empty() {
+            return classify_query(body);
+        }
+    }
+    StatementKind::DataWrite {
+        target_tables: Vec::new(),
+        opaque: true,
     }
 }
 
@@ -520,7 +778,6 @@ fn idents_after_lock(tokens: &[Token]) -> Vec<String> {
 const NOISE_FUNCTIONS: &[&str] = &[
     "version",
     "current_setting",
-    "set_config",
     "current_schema",
     "current_schemas",
     "current_database",
@@ -547,8 +804,10 @@ const NOISE_FUNCTIONS: &[&str] = &[
     "obj_description",
     "col_description",
     "pg_typeof",
-    "txid_current",
-    "pg_current_xact_id",
+    "pg_table_is_visible",
+    "pg_type_is_visible",
+    "pg_function_is_visible",
+    "pg_encoding_to_char",
     "coalesce",
     "nullif",
     "greatest",
@@ -572,6 +831,32 @@ const ADVISORY_LOCK_FUNCTIONS: &[&str] = &[
     "pg_try_advisory_lock_shared",
     "pg_try_advisory_xact_lock",
     "pg_try_advisory_xact_lock_shared",
+    "pg_advisory_unlock",
+    "pg_advisory_unlock_shared",
+    "pg_advisory_unlock_all",
+];
+
+const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
+    "nextval",
+    "setval",
+    "currval",
+    "lastval",
+    "set_config",
+    "txid_current",
+    "pg_current_xact_id",
+    "pg_notify",
+    "pg_terminate_backend",
+    "pg_cancel_backend",
+    "lo_create",
+    "lo_creat",
+    "lo_import",
+    "lo_unlink",
+    "lo_put",
+    "lo_from_bytea",
+    "dblink",
+    "dblink_exec",
+    "pg_logical_emit_message",
+    "pg_stat_reset",
 ];
 
 fn is_system_relation(name: &str) -> bool {
@@ -686,7 +971,24 @@ fn scan_query(tokens: &[Token]) -> QueryScan {
                     continue;
                 }
             }
-            "into" if first == "select" && !matches!(prev, Some("insert" | "merge")) => {
+            "table"
+                if i == 0
+                    || matches!(
+                        prev,
+                        Some("union" | "intersect" | "except" | "all" | "distinct")
+                    ) =>
+            {
+                let j = skip_words(tokens, i + 1, &["only"]);
+                if let Some((name, next)) = qualified_name(tokens, j) {
+                    reads.push(name);
+                    i = next;
+                    continue;
+                }
+            }
+            "into"
+                if matches!(first, "select" | "with")
+                    && !matches!(prev, Some("insert" | "merge")) =>
+            {
                 let j = skip_words(
                     tokens,
                     i + 1,
@@ -700,34 +1002,38 @@ fn scan_query(tokens: &[Token]) -> QueryScan {
             }
             "from" | "join" | "using" if prev != Some("is") && prev != Some("distinct") => {
                 let mut j = skip_words(tokens, i + 1, &["only", "lateral"]);
-                while let Some((name, next)) = qualified_name(tokens, j) {
-                    if tokens.get(next) == Some(&Token::Symbol('(')) {
-                        // Set-returning function in FROM.
-                        let fname = name.rsplit('.').next().unwrap_or(&name).to_lowercase();
-                        if !NOISE_FUNCTIONS.contains(&fname.as_str()) {
-                            user_functions = true;
+                loop {
+                    if tokens.get(j) == Some(&Token::Symbol('(')) {
+                        // Skip balanced parenthesized subquery, VALUES, or join
+                        // to reach any following comma-separated FROM items;
+                        // the outer loop still descends into the parentheses.
+                        j = skip_balanced_parens(tokens, j);
+                    } else if let Some((name, next)) = qualified_name(tokens, j) {
+                        if tokens.get(next) == Some(&Token::Symbol('(')) {
+                            let fname = name.rsplit('.').next().unwrap_or(&name).to_lowercase();
+                            if !is_pure_function_call(&fname) {
+                                user_functions = true;
+                            }
+                            if ADVISORY_LOCK_FUNCTIONS.contains(&fname.as_str()) {
+                                advisory = true;
+                                row_lock.get_or_insert(RowLock::Advisory);
+                            }
+                            calls.push(fname);
+                            j = skip_balanced_parens(tokens, next);
+                        } else {
+                            reads.push(name);
+                            j = next;
                         }
-                        calls.push(fname);
-                        j = next;
+                    } else {
                         break;
                     }
-                    reads.push(name);
-                    j = next;
-                    // Skip an optional alias, then continue a comma list.
-                    j = skip_words(tokens, j, &["as"]);
-                    if let Some(Token::Word(alias)) = tokens.get(j)
-                        && !is_clause_keyword(alias)
-                    {
-                        j += 1;
-                    }
+                    j = skip_from_item_tail(tokens, j);
                     if tokens.get(j) == Some(&Token::Symbol(',')) {
                         j = skip_words(tokens, j + 1, &["only", "lateral"]);
                         continue;
                     }
                     break;
                 }
-                i = j.max(i + 1);
-                continue;
             }
             "for" => {
                 let next = tokens.get(i + 1).and_then(Token::word);
@@ -751,21 +1057,13 @@ fn scan_query(tokens: &[Token]) -> QueryScan {
                 if is_cte_name(tokens, i) {
                     ctes.push(w.to_owned());
                 } else if tokens.get(i + 1) == Some(&Token::Symbol('(')) && prev != Some("into") {
-                    let qualified_noise = i >= 2
-                        && tokens[i - 1] == Token::Symbol('.')
-                        && tokens[i - 2].is_word("pg_catalog");
                     if !is_call_syntax(w) {
                         calls.push(w.to_owned());
                     }
                     if ADVISORY_LOCK_FUNCTIONS.contains(&w) {
                         advisory = true;
                         row_lock.get_or_insert(RowLock::Advisory);
-                    } else if !qualified_noise
-                        && !NOISE_FUNCTIONS.contains(&w)
-                        && !is_sql_keyword_call(w)
-                        && !w.starts_with("pg_get_")
-                        && !w.starts_with("has_")
-                    {
+                    } else if SIDE_EFFECT_FUNCTIONS.contains(&w) || !is_pure_function_call(w) {
                         user_functions = true;
                     }
                 }
@@ -791,11 +1089,71 @@ fn scan_query(tokens: &[Token]) -> QueryScan {
     }
 }
 
+fn is_pure_function_call(w: &str) -> bool {
+    !SIDE_EFFECT_FUNCTIONS.contains(&w)
+        && (NOISE_FUNCTIONS.contains(&w)
+            || is_sql_keyword_call(w)
+            || w.starts_with("pg_get_")
+            || w.starts_with("has_"))
+}
+
+/// Advances past a `(...)` group starting at `start` (assumed to be `'('`).
+fn skip_balanced_parens(tokens: &[Token], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut j = start;
+    while j < tokens.len() {
+        match tokens[j] {
+            Token::Symbol('(') => depth += 1,
+            Token::Symbol(')') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return j + 1;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    j
+}
+
+/// Advances past optional `TABLESAMPLE`, `WITH ORDINALITY`, `[AS] alias`, and
+/// column-alias lists `(c1, c2)` after a `FROM` item.
+fn skip_from_item_tail(tokens: &[Token], mut j: usize) -> usize {
+    if tokens.get(j).is_some_and(|t| t.is_word("tablesample")) {
+        j += 1;
+        if let Some((_, next)) = qualified_name(tokens, j) {
+            j = next;
+        }
+        if tokens.get(j) == Some(&Token::Symbol('(')) {
+            j = skip_balanced_parens(tokens, j);
+        }
+        if tokens.get(j).is_some_and(|t| t.is_word("repeatable")) {
+            j += 1;
+            if tokens.get(j) == Some(&Token::Symbol('(')) {
+                j = skip_balanced_parens(tokens, j);
+            }
+        }
+    }
+    if tokens.get(j).is_some_and(|t| t.is_word("with"))
+        && tokens.get(j + 1).is_some_and(|t| t.is_word("ordinality"))
+    {
+        j += 2;
+    }
+    j = skip_words(tokens, j, &["as"]);
+    match tokens.get(j) {
+        Some(Token::Word(alias)) if !is_clause_keyword(alias) => j += 1,
+        Some(Token::Quoted(_)) => j += 1,
+        _ => {}
+    }
+    if tokens.get(j) == Some(&Token::Symbol('(')) {
+        j = skip_balanced_parens(tokens, j);
+    }
+    j
+}
+
 fn classify_query(tokens: &[Token]) -> StatementKind {
     let first = tokens.first().and_then(Token::word).unwrap_or_default();
-    if first == "notify" {
-        return StatementKind::Noise;
-    }
     let QueryScan {
         writes,
         reads,
@@ -805,6 +1163,14 @@ fn classify_query(tokens: &[Token]) -> StatementKind {
         ..
     } = scan_query(tokens);
 
+    if user_functions && !is_copy_to {
+        // Any non-pure function call (user-defined or side-effecting builtin)
+        // may mutate arbitrary tables even when embedded in a SELECT or UPDATE.
+        return StatementKind::DataWrite {
+            target_tables: writes,
+            opaque: true,
+        };
+    }
     if !writes.is_empty() {
         return StatementKind::DataWrite {
             target_tables: writes,
@@ -821,13 +1187,6 @@ fn classify_query(tokens: &[Token]) -> StatementKind {
         "insert" | "update" | "delete" | "merge" | "truncate" | "copy"
     ) && !is_copy_to
     {
-        return StatementKind::DataWrite {
-            target_tables: Vec::new(),
-            opaque: true,
-        };
-    }
-    if user_reads.is_empty() && reads.is_empty() && user_functions && row_lock.is_none() {
-        // `SELECT my_procedure(...)` may mutate arbitrary tables.
         return StatementKind::DataWrite {
             target_tables: Vec::new(),
             opaque: true,
@@ -911,7 +1270,20 @@ fn access_of(tokens: &[Token]) -> Access {
             writes: idents_after_lock(tokens),
             ..Access::default()
         },
-        "notify" => Access::default(),
+        "declare" => {
+            if let Some(cursor_pos) = tokens.iter().position(|t| t.is_word("cursor"))
+                && let Some(rel) = tokens[cursor_pos + 1..]
+                    .iter()
+                    .position(|t| t.is_word("for"))
+            {
+                let body = &tokens[cursor_pos + 1 + rel + 1..];
+                if !body.is_empty() {
+                    return access_of_query(body);
+                }
+            }
+            Access::opaque()
+        }
+        "fetch" | "move" | "notify" => Access::opaque(),
         _ => match classify_statement(tokens) {
             StatementKind::Noise => Access::default(),
             StatementKind::TransactionControl(tc) => Access {
@@ -924,11 +1296,16 @@ fn access_of(tokens: &[Token]) -> Access {
 }
 
 fn access_of_query(tokens: &[Token]) -> Access {
-    let opaque = matches!(
-        classify_query(tokens),
-        StatementKind::DataWrite { opaque: true, .. }
-    );
+    let first = tokens.first().and_then(Token::word).unwrap_or_default();
     let scan = scan_query(tokens);
+    let dml_without_target = matches!(
+        first,
+        "insert" | "update" | "delete" | "merge" | "truncate" | "copy"
+    ) && !scan.is_copy_to
+        && scan.writes.is_empty();
+    let bare_user_call =
+        scan.reads.is_empty() && scan.writes.is_empty() && scan.user_functions && !scan.advisory;
+    let opaque = dml_without_target || bare_user_call;
     let shadowed = |name: &String| {
         let rel = name.rsplit('.').next().unwrap_or(name);
         !name.contains('.') && scan.ctes.iter().any(|c| c == rel)
@@ -1097,10 +1474,6 @@ fn is_sql_keyword_call(w: &str) -> bool {
             | "round"
             | "extract"
             | "interval"
-            | "nextval"
-            | "currval"
-            | "setval"
-            | "lastval"
             | "jsonb_build_object"
             | "json_build_object"
             | "to_json"
@@ -1111,6 +1484,18 @@ fn is_sql_keyword_call(w: &str) -> bool {
             | "trim"
             | "position"
             | "overlay"
+            | "bool_and"
+            | "bool_or"
+            | "every"
+            | "json_agg"
+            | "jsonb_agg"
+            | "row_number"
+            | "rank"
+            | "dense_rank"
+            | "lag"
+            | "lead"
+            | "first_value"
+            | "last_value"
     )
 }
 
@@ -1433,6 +1818,155 @@ mod tests {
         assert_eq!(
             access("EXPLAIN ANALYZE SELECT * FROM t").reads,
             names(&["t"])
+        );
+    }
+
+    #[test]
+    fn sequences_and_side_effect_builtins_are_not_noise() {
+        for sql in [
+            "SELECT nextval('order_seq')",
+            "SELECT currval('order_seq')",
+            "SELECT setval('order_seq', 42)",
+            "SELECT lastval()",
+            "SELECT set_config('app.tenant', '1', true)",
+            "SELECT txid_current()",
+            "SELECT pg_current_xact_id()",
+            "SELECT pg_catalog.pg_advisory_unlock(1)",
+            "SELECT pg_catalog.pg_advisory_lock(1)",
+            "SELECT pg_catalog.nextval('order_seq')",
+        ] {
+            assert!(
+                !classify_sql(sql).is_noise(),
+                "expected non-noise classification for: {sql}"
+            );
+        }
+        assert!(access("SELECT pg_catalog.pg_advisory_unlock(1)").advisory);
+        assert!(access("SELECT pg_advisory_unlock_all()").advisory);
+    }
+
+    #[test]
+    fn table_cursor_notify_and_role_changes_are_classified() {
+        assert_eq!(
+            single("TABLE wallets"),
+            StatementKind::DataRead {
+                tables: names(&["wallets"]),
+                row_lock: None,
+            }
+        );
+        assert_eq!(
+            single("TABLE ONLY public.wallets"),
+            StatementKind::DataRead {
+                tables: names(&["public.wallets"]),
+                row_lock: None,
+            }
+        );
+        assert_eq!(
+            single("DECLARE c CURSOR FOR SELECT * FROM wallets FOR UPDATE"),
+            StatementKind::DataRead {
+                tables: names(&["wallets"]),
+                row_lock: Some(RowLock::ForUpdate),
+            }
+        );
+        for opaque in [
+            "FETCH NEXT FROM c",
+            "MOVE FORWARD 1 FROM c",
+            "NOTIFY orders, 'paid'",
+            "SET LOCAL ROLE tenant_a",
+            "SET ROLE tenant_a",
+            "SET SESSION AUTHORIZATION app_user",
+        ] {
+            assert_eq!(
+                single(opaque),
+                StatementKind::DataWrite {
+                    target_tables: Vec::new(),
+                    opaque: true,
+                },
+                "{opaque}"
+            );
+            assert!(access(opaque).opaque, "{opaque}");
+        }
+    }
+
+    #[test]
+    fn comma_joins_with_quoted_aliases_subqueries_and_srfs_capture_all_tables() {
+        assert_eq!(
+            access(r#"SELECT * FROM a "a1", b "b1""#).reads,
+            names(&["a", "b"])
+        );
+        assert_eq!(
+            access("SELECT * FROM a AS a1(id, name), b").reads,
+            names(&["a", "b"])
+        );
+        assert_eq!(
+            access("SELECT * FROM (VALUES (1)) AS v(id), wallets").reads,
+            names(&["wallets"])
+        );
+        assert_eq!(
+            access("SELECT * FROM unnest($1::int[]) u, wallets").reads,
+            names(&["wallets"])
+        );
+        assert_eq!(
+            access("SELECT * FROM a TABLESAMPLE SYSTEM (10) AS s, b").reads,
+            names(&["a", "b"])
+        );
+        assert_eq!(
+            access("SELECT * FROM generate_series(1, 5) WITH ORDINALITY AS g(n, ord), wallets")
+                .reads,
+            names(&["wallets"])
+        );
+    }
+
+    #[test]
+    fn select_into_inside_with_is_data_write() {
+        let a =
+            access("WITH src AS (SELECT id FROM wallets) SELECT id INTO backup_wallets FROM src");
+        assert_eq!(a.writes, names(&["backup_wallets"]));
+        assert_eq!(a.reads, names(&["wallets"]));
+    }
+
+    #[test]
+    fn user_function_calls_mark_data_write_opaque() {
+        for sql in [
+            "SELECT debit_wallet(1, 100) FROM wallets",
+            "UPDATE wallets SET balance = compute_next(balance) WHERE id = 1",
+        ] {
+            assert!(
+                matches!(single(sql), StatementKind::DataWrite { opaque: true, .. }),
+                "{sql}: {:?}",
+                single(sql)
+            );
+        }
+        assert!(
+            access("SELECT debit_wallet(1, 100) FROM wallets")
+                .calls
+                .contains(&"debit_wallet".to_owned())
+        );
+    }
+
+    #[test]
+    fn session_sql_ops_detect_prepare_deallocate_and_discard() {
+        assert_eq!(
+            session_sql_ops("DISCARD ALL"),
+            vec![SessionSqlOp::ClearStatements]
+        );
+        assert_eq!(
+            session_sql_ops("DISCARD PLANS"),
+            vec![SessionSqlOp::ClearStatements]
+        );
+        assert_eq!(
+            session_sql_ops("DEALLOCATE ALL"),
+            vec![SessionSqlOp::ClearStatements]
+        );
+        assert_eq!(
+            session_sql_ops(r#"DEALLOCATE PREPARE "MyStmt""#),
+            vec![SessionSqlOp::DeallocateStatement("MyStmt".into())]
+        );
+        assert_eq!(
+            session_sql_ops("PREPARE q(int) AS SELECT * FROM wallets WHERE id = $1"),
+            vec![SessionSqlOp::PrepareStatement {
+                name: "q".into(),
+                sql: "SELECT * FROM wallets WHERE id = $1".into(),
+            }]
         );
     }
 }

@@ -1,16 +1,16 @@
 //! A scenario session: database preparation, the proxy, the target service
 //! and the coordinator, torn down in reverse order.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
-
 use std::sync::Arc;
+use std::time::Duration;
 
 use pgloom_driver::{Config, ReductionName, ScenarioWorkload, StrategyName, proxied_env};
 use pgloom_engine::coordinator::pg::{PgDbControl, ResetStrategy};
 use pgloom_engine::{
-    Coordinator, CoordinatorConfig, EpisodeResult, Reduction, RunControl, RunReport,
-    ScheduleExplorer, SchemaModel, Strategy, WorkerId,
+    Coordinator, CoordinatorConfig, DbControl, EngineError, EpisodeRecord, EpisodeResult,
+    Reduction, RunControl, RunReport, ScheduleExplorer, SchemaModel, Strategy, WorkerId,
 };
 use pgloom_pgctrl::{PgControl, PgUrl, Snapshot, SnapshotOptions, SqlInvariant};
 use pgloom_wire::{ProxyConfig, ProxyHandle, spawn_proxy};
@@ -103,17 +103,55 @@ pub fn strategy_of(config: &Config) -> Strategy {
 }
 
 #[derive(Debug)]
+struct SessionDbControl {
+    pg: PgDbControl,
+    reset_http: Option<(reqwest::Client, String)>,
+}
+
+impl DbControl for SessionDbControl {
+    async fn blocking_pids(&self, pids: &[i32]) -> Result<BTreeMap<i32, Vec<i32>>, EngineError> {
+        self.pg.blocking_pids(pids).await
+    }
+
+    async fn cancel_backend(&self, pid: i32) -> Result<(), EngineError> {
+        self.pg.cancel_backend(pid).await
+    }
+
+    async fn cleanup_backends(&self, pids: &[i32]) -> Result<Vec<i32>, EngineError> {
+        self.pg.cleanup_backends(pids).await
+    }
+
+    async fn reset(&self, record: &EpisodeRecord) -> Result<(), EngineError> {
+        self.pg.reset(record).await?;
+        if let Some((client, url)) = &self.reset_http {
+            let resp = client
+                .post(url)
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+                .map_err(|e| EngineError::Db(format!("target.reset_http ({url}): {e}")))?;
+            if !resp.status().is_success() {
+                return Err(EngineError::Db(format!(
+                    "target.reset_http ({url}) returned HTTP {}",
+                    resp.status().as_u16()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub struct Session {
     config: Config,
     workers: Vec<String>,
     upstream: PgUrl,
     proxy: Option<ProxyHandle>,
     proxy_url: String,
-    ctl: PgControl,
     snapshot: bool,
     reduction: Reduction,
     target: std::sync::Mutex<Option<TargetProcess>>,
-    coordinator: Coordinator<ScenarioWorkload, PgDbControl, ScenarioOracle>,
+    coordinator: Coordinator<ScenarioWorkload, SessionDbControl, ScenarioOracle>,
 }
 
 impl Session {
@@ -199,12 +237,19 @@ impl Session {
         let workers: Vec<String> = config.workers.iter().map(|w| w.id.clone()).collect();
         let workload = ScenarioWorkload::new(&config.workers, proxy_url.clone())
             .map_err(|e| CliError::Config(e.to_string()))?;
-        let connect = || async {
-            PgControl::connect(url)
-                .await
-                .map_err(|e| CliError::env("cannot connect to the upstream database", e))
+        let oracle_ctl = PgControl::connect(url)
+            .await
+            .map_err(|e| CliError::env("cannot connect to the upstream database", e))?;
+        let reset_http = match config.target.as_ref().and_then(|t| t.reset_http.clone()) {
+            Some(url) => {
+                let client = reqwest::Client::builder()
+                    .pool_max_idle_per_host(1)
+                    .build()
+                    .map_err(|e| CliError::env("cannot build reset_http client", e))?;
+                Some((client, url))
+            }
+            None => None,
         };
-        let (db_ctl, oracle_ctl) = (connect().await?, connect().await?);
 
         // Last fallible step: nothing after it can leave the snapshot behind.
         let (reset, snapshot, schema) = Self::capture_reference(&config, &ctl).await?;
@@ -213,7 +258,10 @@ impl Session {
         } else {
             Reduction::None
         };
-        let db = PgDbControl { ctl: db_ctl, reset };
+        let db = SessionDbControl {
+            pg: PgDbControl { ctl, reset },
+            reset_http,
+        };
         let oracle = ScenarioOracle {
             ctl: oracle_ctl,
             sql: config
@@ -247,7 +295,6 @@ impl Session {
             upstream,
             proxy: Some(proxy),
             proxy_url,
-            ctl,
             snapshot,
             reduction,
             target: std::sync::Mutex::new(target),
@@ -416,7 +463,7 @@ impl Session {
             p.shutdown().await;
         }
         if self.snapshot
-            && let Err(e) = Snapshot::discard(&self.ctl).await
+            && let Err(e) = Snapshot::discard(&self.coordinator.db().pg.ctl).await
         {
             warn!("cannot drop the snapshot schema: {e}");
         }

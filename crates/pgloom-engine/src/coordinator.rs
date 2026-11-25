@@ -226,6 +226,8 @@ pub struct RunReport {
     /// Database turns the workers sent through the proxy, across all
     /// schedules. Zero means the service never used the proxy.
     pub turns: usize,
+    /// Turns forwarded unsupervised because no worker slot was free.
+    pub unsupervised_turns: usize,
     /// The run stopped early on [`RunControl::request_stop`].
     pub interrupted: bool,
     pub failures: Vec<Failure>,
@@ -279,6 +281,10 @@ impl<W: Workload, D: DbControl, O: EpisodeOracle> Coordinator<W, D, O> {
         &self.workload
     }
 
+    pub fn db(&self) -> &D {
+        &self.db
+    }
+
     /// Explores schedules until the explorer is exhausted, its budget is
     /// spent, or (by default) the first violation is found and shrunk.
     pub async fn run(&self, mut explorer: ScheduleExplorer) -> Result<RunReport, EngineError> {
@@ -289,6 +295,7 @@ impl<W: Workload, D: DbControl, O: EpisodeOracle> Coordinator<W, D, O> {
         let mut signatures: Vec<BTreeSet<String>> = Vec::new();
         let mut parks = 0;
         let mut turns = 0;
+        let mut unsupervised_turns = 0;
         let mut interrupted = false;
         self.control.schedules.store(0, Ordering::Relaxed);
         self.control.failures.store(0, Ordering::Relaxed);
@@ -304,6 +311,7 @@ impl<W: Workload, D: DbControl, O: EpisodeOracle> Coordinator<W, D, O> {
             self.control.schedules.fetch_add(1, Ordering::Relaxed);
             parks += episode.parks;
             turns += episode.record.turns();
+            unsupervised_turns += episode.record.unsupervised_turns;
             if episode.pruned || episode.violations.is_empty() {
                 continue;
             }
@@ -340,6 +348,7 @@ impl<W: Workload, D: DbControl, O: EpisodeOracle> Coordinator<W, D, O> {
             elapsed: started.elapsed(),
             parks,
             turns,
+            unsupervised_turns,
             interrupted,
             failures,
         })
@@ -378,10 +387,11 @@ impl<W: Workload, D: DbControl, O: EpisodeOracle> Coordinator<W, D, O> {
                     );
                     ex.next_schedule();
                     match self.run_episode(&mut ex).await {
-                        Ok(ep) if ep.violations.iter().any(|v| names.contains(&v.name())) => {
-                            Some(ep.schedule)
+                        Ok(ep) => {
+                            let ep_names: BTreeSet<String> =
+                                ep.violations.iter().map(Violation::name).collect();
+                            names.is_subset(&ep_names).then_some(ep.schedule)
                         }
-                        Ok(_) => None,
                         Err(err) => {
                             debug!(%err, "shrink candidate failed to execute");
                             None
@@ -396,10 +406,14 @@ impl<W: Workload, D: DbControl, O: EpisodeOracle> Coordinator<W, D, O> {
             return Ok(failure);
         }
         // Re-execute the minimal schedule strictly to capture its record and
-        // to confirm it reproduces deterministically.
+        // to confirm it reproduces every violated invariant deterministically.
         let replayed = self.replay(outcome.schedule.choices()).await?;
-        if replayed.violations.is_empty() {
-            warn!("shrunk schedule did not reproduce on strict replay; keeping the original");
+        let replayed_names: BTreeSet<String> =
+            replayed.violations.iter().map(Violation::name).collect();
+        if !names.is_subset(&replayed_names) {
+            warn!(
+                "shrunk schedule did not reproduce all violations on strict replay; keeping the original"
+            );
             return Ok(failure);
         }
         Ok(Failure {
@@ -435,27 +449,27 @@ impl<W: Workload, D: DbControl, O: EpisodeOracle> Coordinator<W, D, O> {
             if let Err(e) = self.db.cleanup_backends(&pids).await {
                 warn!(err = %e, "backend cleanup failed");
             }
+            if let Err(e) = self.db.reset(&record).await {
+                warn!(err = %e, "database reset after episode error failed");
+            }
             return Err(err);
         }
 
-        // Leftover transactions are terminated while the invariants run: a
-        // terminated backend only rolls back work the oracle cannot see.
-        let check = !pruned && deadlock.is_none();
-        let (terminated, checked) = tokio::join!(self.db.cleanup_backends(&pids), async {
-            if check {
-                self.oracle.check(&record).await.map(Some)
-            } else {
-                Ok(None)
-            }
-        });
-        match terminated {
+        // Terminate leftover transactions, advisory locks, and temp tables
+        // before running SQL invariants so the oracle observes a quiescent DB.
+        match self.db.cleanup_backends(&pids).await {
             Ok(t) if !t.is_empty() => {
-                warn!(pids = ?t, "terminated backends left with open transactions");
+                warn!(pids = ?t, "terminated backends left with open session state");
             }
             Ok(_) => {}
             Err(err) => warn!(%err, "backend cleanup failed"),
         }
-        let mut violations = checked?.unwrap_or_default();
+        let check = !pruned && deadlock.is_none();
+        let mut violations = if check {
+            self.oracle.check(&record).await?
+        } else {
+            Vec::new()
+        };
         if let Some(v) = deadlock {
             record.deadlock = Some(v.clone());
             violations.push(v);
@@ -550,7 +564,10 @@ struct Episode<'a, W, D, O> {
     begin_in_flight: BTreeMap<ConnId, (WorkerId, TurnInfo)>,
     /// Connections whose turns could not be attributed and were let through.
     passthrough: BTreeSet<ConnId>,
+    /// Active backend pid -> current owning worker for lock attribution.
     pid_owner: BTreeMap<i32, WorkerId>,
+    /// Every backend pid observed during this episode, for end-of-episode cleanup.
+    all_seen_pids: BTreeSet<i32>,
     record: EpisodeRecord,
     violation: Option<Violation>,
     next_preempted: bool,
@@ -587,6 +604,7 @@ impl<'a, W: Workload, D: DbControl, O: EpisodeOracle> Episode<'a, W, D, O> {
             begin_in_flight: BTreeMap::new(),
             passthrough: BTreeSet::new(),
             pid_owner: BTreeMap::new(),
+            all_seen_pids: BTreeSet::new(),
             record: EpisodeRecord {
                 outcomes: vec![None; n],
                 backend_pids: vec![None; n],
@@ -658,7 +676,7 @@ impl<'a, W: Workload, D: DbControl, O: EpisodeOracle> Episode<'a, W, D, O> {
     }
 
     fn tracked_pids(&self) -> Vec<i32> {
-        self.pid_owner.keys().copied().collect()
+        self.all_seen_pids.iter().copied().collect()
     }
 
     fn all_finished(&self) -> bool {
@@ -679,6 +697,7 @@ impl<'a, W: Workload, D: DbControl, O: EpisodeOracle> Episode<'a, W, D, O> {
         }
 
         let mut last: Option<WorkerId> = None;
+        let mut stalled_since: Option<tokio::time::Instant> = None;
         loop {
             self.refresh_parked().await?;
             if self.violation.is_some() {
@@ -695,12 +714,21 @@ impl<'a, W: Workload, D: DbControl, O: EpisodeOracle> Episode<'a, W, D, O> {
                 if self.all_finished() {
                     return Ok(());
                 }
-                self.wait_for_progress().await?;
+                let since = *stalled_since.get_or_insert_with(tokio::time::Instant::now);
+                let budget = if self.graph.detect_cycle().is_some() {
+                    // When `fail_on_deadlock` is false, give PostgreSQL's own
+                    // `deadlock_timeout` time to abort one participant with 40P01.
+                    self.cfg().step_timeout.max(Duration::from_secs(5))
+                } else {
+                    self.cfg().step_timeout
+                };
+                if self.wait_for_progress(since + budget).await? {
+                    stalled_since = None;
+                }
                 continue;
             }
-            let current = last.filter(|w| {
-                enabled.contains(w) && self.workers[w.index()].tx_status.in_transaction()
-            });
+            stalled_since = None;
+            let current = last.filter(|w| enabled.contains(w));
             let footprints: Vec<Footprint> = if self.reduces {
                 enabled.iter().map(|w| self.next_footprint(*w)).collect()
             } else {
@@ -743,10 +771,9 @@ impl<'a, W: Workload, D: DbControl, O: EpisodeOracle> Episode<'a, W, D, O> {
                         self.step(chosen, StepAction::Resume, &info, Some(&finished.response));
                     step.preempted = preempted;
                     self.record.steps.push(step);
-                    self.set_tx_status(
-                        chosen,
-                        finished.response.tx_status.unwrap_or(TxStatus::Idle),
-                    );
+                    if let Some(status) = finished.response.tx_status {
+                        self.set_tx_status(chosen, status);
+                    }
                     self.check_postgres_deadlock(chosen, &info, &finished.response);
                     finished.release.release();
                     self.free = Some(chosen);
@@ -962,13 +989,19 @@ impl<'a, W: Workload, D: DbControl, O: EpisodeOracle> Episode<'a, W, D, O> {
     }
 
     /// Nothing is enabled but workers remain: wait for any progress.
-    async fn wait_for_progress(&mut self) -> Result<(), EngineError> {
-        let deadline = tokio::time::Instant::now() + self.cfg().step_timeout;
+    /// Returns `true` when an event was absorbed.
+    async fn wait_for_progress(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, EngineError> {
         let probe = tokio::time::Instant::now() + self.cfg().lock_probe * 4;
         match self.next_event(probe.min(deadline)).await {
             Event::Timeout if tokio::time::Instant::now() >= deadline => Err(self.stalled()),
-            Event::Timeout => Ok(()),
-            ev => self.absorb(ev).await,
+            Event::Timeout => Ok(false),
+            ev => {
+                self.absorb(ev).await?;
+                Ok(true)
+            }
         }
     }
 
@@ -989,6 +1022,16 @@ impl<'a, W: Workload, D: DbControl, O: EpisodeOracle> Episode<'a, W, D, O> {
         let Some(cycle) = self.graph.detect_cycle() else {
             return Ok(());
         };
+        if !self.cfg().fail_on_deadlock {
+            // Leave the lock cycle intact so PostgreSQL's own deadlock
+            // detector breaks it with genuine SQLSTATE 40P01 rather than
+            // `pg_cancel_backend`'s 57014 (`query_canceled`).
+            debug!(
+                ?cycle,
+                "deadlock cycle observed; deferring resolution to PostgreSQL"
+            );
+            return Ok(());
+        }
         let statements: Vec<(WorkerId, String)> = cycle
             .iter()
             .map(|w| {
@@ -1000,8 +1043,8 @@ impl<'a, W: Workload, D: DbControl, O: EpisodeOracle> Episode<'a, W, D, O> {
                 (*w, sql)
             })
             .collect();
-        // Break the cycle the way PostgreSQL would: abort the most recent
-        // waiter, so no session sits in a lock wait until deadlock_timeout.
+        // Break the cycle immediately so no session sits in a lock wait until
+        // `deadlock_timeout` expires before cleanup.
         let victim = self
             .record
             .steps
@@ -1014,14 +1057,12 @@ impl<'a, W: Workload, D: DbControl, O: EpisodeOracle> Episode<'a, W, D, O> {
             self.co.db.cancel_backend(pid).await?;
         }
         self.graph.unpark(victim);
-        if self.cfg().fail_on_deadlock {
-            debug!(?cycle, "deadlock proven by wait-for graph");
-            self.violation = Some(Violation::Deadlock {
-                cycle,
-                source: DeadlockSource::WaitForGraph,
-                statements,
-            });
-        }
+        debug!(?cycle, "deadlock proven by wait-for graph");
+        self.violation = Some(Violation::Deadlock {
+            cycle,
+            source: DeadlockSource::WaitForGraph,
+            statements,
+        });
         Ok(())
     }
 
@@ -1104,6 +1145,14 @@ impl<'a, W: Workload, D: DbControl, O: EpisodeOracle> Episode<'a, W, D, O> {
         if !matches!(previous, Slot::Running) {
             warn!(worker = %w, "worker finished while holding a pending turn");
         }
+        let finished_idle_pid = (!state.tx_status.in_transaction())
+            .then_some(state.pid)
+            .flatten();
+        if let Some(pid) = finished_idle_pid
+            && self.pid_owner.get(&pid) == Some(&w)
+        {
+            self.pid_owner.remove(&pid);
+        }
         self.graph.unpark(w);
         if self.free == Some(w) {
             self.free = None;
@@ -1130,12 +1179,23 @@ impl<'a, W: Workload, D: DbControl, O: EpisodeOracle> Episode<'a, W, D, O> {
                 sql = %pending.info.sql_text(),
                 "turn from a connection outside the scheduled workers; letting it through"
             );
+            if let Some(pid) = pending.info.backend_pid {
+                self.all_seen_pids.insert(pid.0);
+            }
+            self.record.unsupervised_turns += 1;
             self.note_writes(&pending.info);
             self.passthrough.insert(pending.info.conn);
             pending.permit.grant();
             return;
         };
         if let Some(pid) = pending.info.backend_pid {
+            self.all_seen_pids.insert(pid.0);
+            if let Some(old_pid) = self.workers[w.index()].pid
+                && old_pid != pid.0
+                && self.pid_owner.get(&old_pid) == Some(&w)
+            {
+                self.pid_owner.remove(&old_pid);
+            }
             self.pid_owner.insert(pid.0, w);
             self.workers[w.index()].pid = Some(pid.0);
             self.record.backend_pids[w.index()] = Some(pid.0);
@@ -1161,7 +1221,9 @@ impl<'a, W: Workload, D: DbControl, O: EpisodeOracle> Episode<'a, W, D, O> {
         if let Some((w, info)) = self.begin_in_flight.remove(&conn) {
             let step = self.step(w, StepAction::Begin, &info, Some(&finished.response));
             self.record.steps.push(step);
-            self.set_tx_status(w, finished.response.tx_status.unwrap_or(TxStatus::Idle));
+            if let Some(status) = finished.response.tx_status {
+                self.set_tx_status(w, status);
+            }
             finished.release.release();
             return;
         }
@@ -1180,7 +1242,9 @@ impl<'a, W: Workload, D: DbControl, O: EpisodeOracle> Episode<'a, W, D, O> {
                 let mut step = self.step(w, StepAction::Execute, &info, Some(&finished.response));
                 step.preempted = std::mem::take(&mut self.next_preempted);
                 self.record.steps.push(step);
-                self.set_tx_status(w, finished.response.tx_status.unwrap_or(TxStatus::Idle));
+                if let Some(status) = finished.response.tx_status {
+                    self.set_tx_status(w, status);
+                }
                 self.check_postgres_deadlock(w, &info, &finished.response);
                 self.executing = None;
                 finished.release.release();
@@ -1236,11 +1300,19 @@ impl<'a, W: Workload, D: DbControl, O: EpisodeOracle> Episode<'a, W, D, O> {
         while let Ok(ev) = self.events.try_recv() {
             drop(ev);
         }
+        let mut abandoned_live = false;
         for state in &mut self.workers {
             if !matches!(state.slot, Slot::Finished | Slot::NotLaunched) {
+                abandoned_live = true;
                 // Dropping permits and releases lets held turns proceed.
                 state.slot = Slot::Running;
             }
+        }
+        if abandoned_live {
+            // Workers released after the gate closes may write to any table
+            // unsupervised before they finish, so the database reset must
+            // restore every snapshotted table.
+            self.record.opaque_writes = true;
         }
         self.begin_in_flight.clear();
         let deadline = tokio::time::Instant::now() + self.cfg().drain_timeout;

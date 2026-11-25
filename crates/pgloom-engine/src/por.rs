@@ -131,6 +131,11 @@ impl Footprint {
 const SIDE_EFFECT_BUILTINS: &[&str] = &[
     "nextval",
     "setval",
+    "currval",
+    "lastval",
+    "set_config",
+    "txid_current",
+    "pg_current_xact_id",
     "pg_notify",
     "pg_terminate_backend",
     "pg_cancel_backend",
@@ -166,6 +171,7 @@ struct RelationModel {
 pub struct SchemaModel {
     relations: BTreeMap<String, RelationModel>,
     volatile_functions: BTreeSet<String>,
+    stable_functions: BTreeSet<String>,
 }
 
 fn key(name: &str) -> String {
@@ -271,6 +277,7 @@ impl SchemaModel {
         Self {
             relations,
             volatile_functions: catalog.volatile_functions.iter().cloned().collect(),
+            stable_functions: catalog.stable_functions.iter().cloned().collect(),
         }
     }
 
@@ -305,6 +312,10 @@ impl SchemaModel {
                 || self.volatile_functions.contains(call)
             {
                 return Footprint::everything();
+            } else if self.stable_functions.contains(call) {
+                // STABLE (and non-C SQL/PLpgSQL) functions may SELECT from
+                // arbitrary tables without modifying them.
+                fp.reads = Objects::All;
             }
         }
         if access.advisory {
@@ -428,6 +439,7 @@ mod tests {
                 link(LinkKind::Inherits, 7, 6),
             ],
             volatile_functions: vec!["transfer".into()],
+            stable_functions: vec!["credit_limit".into()],
         })
     }
 
@@ -552,5 +564,28 @@ mod tests {
     fn empty_and_universal_sets_behave() {
         assert!(!Footprint::none().conflicts(&Footprint::everything()));
         assert!(Footprint::everything().conflicts(&Footprint::everything()));
+    }
+
+    #[test]
+    fn stable_user_function_depends_on_concurrent_writes() {
+        let m = model();
+        let call = fp(&m, "SELECT credit_limit()");
+        assert_eq!(call.reads, Objects::All);
+        assert!(call.conflicts(&fp(&m, "UPDATE coupons SET used = true")));
+    }
+
+    #[test]
+    fn side_effect_builtins_conflict_with_concurrent_transactions() {
+        let m = model();
+        let coupons = fp(&m, "UPDATE coupons SET used = true");
+        for sql in [
+            "SELECT set_config('app.tenant', '1', true)",
+            "SELECT currval('ledger_id_seq')",
+            "SELECT lastval()",
+            "SELECT txid_current()",
+            "SELECT pg_current_xact_id()",
+        ] {
+            assert!(fp(&m, sql).conflicts(&coupons), "{sql}");
+        }
     }
 }

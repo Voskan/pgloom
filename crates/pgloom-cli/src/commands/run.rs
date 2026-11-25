@@ -64,7 +64,12 @@ pub fn report_context(config: &Config, workers: &[String], printer: &Printer) ->
 }
 
 pub async fn run(args: RunArgs, printer: Printer) -> Result<u8, CliError> {
-    let loaded = Config::load(&args.config)?;
+    let loaded = Config::load_with_overrides(
+        &args.config,
+        args.connection.upstream.as_deref(),
+        args.connection.listen.as_deref(),
+    )?;
+    let literal_password = loaded.upstream_has_literal_password();
     let mut config = loaded.config;
     overrides(&args).apply(&mut config)?;
     let pretty = args.format == Format::Pretty;
@@ -101,6 +106,14 @@ pub async fn run(args: RunArgs, printer: Printer) -> Result<u8, CliError> {
     session.close().await;
     let report: RunReport = result?;
 
+    if report.unsupervised_turns > 0 {
+        printer.warn(&format!(
+            "{} turn(s) bypassed scheduling because no worker slot was free; \
+             check whether background tasks or connection pools are hitting the proxy",
+            report.unsupervised_turns
+        ));
+    }
+
     let mut ctx = report_context(&config, &workers, &printer);
     if let Some(first) = report.failures.first() {
         let repro = ReproFile::from_failure(
@@ -111,7 +124,16 @@ pub async fn run(args: RunArgs, printer: Printer) -> Result<u8, CliError> {
             first,
         );
         match repro.save(&args.repro_out) {
-            Ok(()) => ctx.repro_path = Some(args.repro_out.display().to_string()),
+            Ok(()) => {
+                if literal_password {
+                    printer.warn(&format!(
+                        "{} embeds database.upstream with a literal password; \
+                         use ${{PGLOOM_UPSTREAM_URL}} before sharing or committing it",
+                        args.repro_out.display()
+                    ));
+                }
+                ctx.repro_path = Some(args.repro_out.display().to_string());
+            }
             Err(e) => printer.warn(&e.to_string()),
         }
     }

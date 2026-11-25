@@ -6,6 +6,70 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-25
+
+### Fixed
+
+- Episode wind-down (`DPOR` sleep-set pruning, deadlock short-circuits, worker
+  errors and shrink attempts) marks `opaque_writes` whenever live connections
+  are drained, and error paths always reset database state before the next
+  schedule runs.
+- Snapshot capture and restore handle user triggers (via `SET LOCAL
+  session_replication_role = replica` when permitted, or `DISABLE`/`ENABLE
+  TRIGGER USER` with `SET CONSTRAINTS ALL DEFERRED` for table owners), circular
+  foreign keys, direct writes to child partitions, classic `INHERITS` tables
+  (`DELETE FROM ONLY`), standalone and `DEFAULT nextval(...)` sequences, and
+  non-`public` `search_path` schemas; unresolved non-temp write targets such as
+  updatable views fail closed instead of leaving stale rows.
+- Idle pooled connections holding session-level advisory locks or temporary
+  tables after a schedule are detected and terminated during reset so session
+  state cannot leak into subsequent schedules.
+- Extended-protocol `Bind` + `Execute` + `Flush` batches (`pgjdbc`
+  `setFetchSize`, `asyncpg` cursors, `libpq` pipelines) are scheduled as
+  `ExecuteFlush` turns and completed cleanly on `CommandComplete`,
+  `PortalSuspended`, `EmptyQueryResponse` or `ErrorResponse`; `Parse` +
+  `Describe` + `Bind` + `Flush` drains `BindComplete` in wire order.
+- Per-connection prepared statement and column caches roll back on failed
+  `Parse`, `Bind` or `Close` turns, stay synchronized across `DISCARD ALL`,
+  `DEALLOCATE` and SQL `PREPARE`, and classify unknown prepared statements
+  fail-closed as opaque writes.
+- SQL classification and DPOR dependency analysis treat sequence mutations
+  (`nextval`, `setval`, `currval`, `lastval`), side-effecting built-ins
+  (`set_config`, `pg_advisory_unlock*`, `lo_*`), `TABLE`, `DECLARE` / `FETCH` /
+  `MOVE`, `NOTIFY`, `SELECT ... INTO` inside `WITH`, role switches, and user or
+  `STABLE` functions conservatively instead of bypassing the gate or commuting
+  across concurrent writes; multi-table `FROM` / `USING` scans preserve tables
+  after quoted aliases, column alias lists, subqueries and set-returning
+  functions.
+- Preemption-bounded exploration (`bounded`) updates the active worker across
+  autocommit turns (`current` is preserved outside explicit `BEGIN ... COMMIT`
+  blocks) so preemption budgets are enforced accurately for autocommit
+  services.
+- When `invariants.fail_on_deadlock` is `false`, wait-for cycles release held
+  waiters so PostgreSQL raises `SQLSTATE 40P01` to the application's retry
+  logic instead of terminating the run as a violation.
+- Schedule shrinking with `--find-all` requires a candidate trace to preserve
+  the full set of violated invariants rather than collapsing onto an unrelated
+  single-invariant failure.
+- Fix Advisor parenthesizes `OR` predicates before appending `WHERE` guards,
+  negates multi-term subtractions (`balance - $1 - $2` -> `balance >= ($1) +
+  ($2)`), scopes `SET` rewrites to numeric columns read in the transaction,
+  handles `FOR SHARE` / `FOR KEY SHARE` upgrades, emits `FOR NO KEY UPDATE OF
+  <table>` on outer joins, avoids invalid `FOR UPDATE` on `UNION`, `WITH` CTE
+  and window queries, and skips duplicate `ON CONFLICT` clauses.
+- `pgloom doctor` skips the `_pgloom_snap` `CREATE` privilege check when
+  `database.reset_sql` is configured, `PgUrl::with_ssl_disabled` strips
+  `channel_binding` and mixed-case SSL parameters, `replay` validates repro
+  files atomically and honours CLI `--upstream` / `--listen` overrides,
+  JSON response invariants compare 64-bit integers without `f64` rounding, wire
+  frame decoding caps incremental buffer reservation, and `exec` workers cap
+  captured output and clean up their process group on exit or timeout.
+
+### Added
+
+- `target.reset_http`: optional HTTP `POST` endpoint called between schedules
+  after database reset to clear in-process caches in the target service.
+
 ## [0.1.2] - 2026-11-14
 
 ### Fixed
@@ -121,7 +185,8 @@ First public release.
 - Commands `run`, `replay`, `demo`, `init` and `doctor`; text and JSON
   reports; `.pgloom-repro.json` files.
 
-[Unreleased]: https://github.com/Voskan/pgloom/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/Voskan/pgloom/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/Voskan/pgloom/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Voskan/pgloom/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Voskan/pgloom/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Voskan/pgloom/releases/tag/v0.1.0

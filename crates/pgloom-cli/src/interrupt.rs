@@ -23,6 +23,11 @@ pub fn requested() -> bool {
     REQUESTED.load(Ordering::SeqCst)
 }
 
+/// Clears a prior interrupt flag.
+pub fn reset() {
+    REQUESTED.store(false, Ordering::SeqCst);
+}
+
 /// Resolves once an interrupt has been requested.
 pub async fn wait() {
     loop {

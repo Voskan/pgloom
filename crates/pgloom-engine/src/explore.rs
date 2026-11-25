@@ -451,7 +451,7 @@ impl ScheduleExplorer {
             self.strategy,
             Strategy::Exhaustive | Strategy::Bounded { .. }
         );
-        let complete = tree && {
+        let complete = tree && self.started > 0 && {
             let mut probe = self.clone();
             let more = !probe.exhausted && probe.backtrack();
             !more && probe.frontier.is_empty() && probe.next_frontier.is_empty()
@@ -1126,6 +1126,13 @@ pub(crate) mod tests {
             )
             .with_reduction(Reduction::Dpor);
             assert!(!bounded.reduces());
+        }
+
+        #[test]
+        fn stats_complete_is_false_before_any_schedule_starts() {
+            let ex = ScheduleExplorer::new(Strategy::Exhaustive, 10);
+            assert_eq!(ex.stats().schedules, 0);
+            assert!(!ex.stats().complete);
         }
     }
 }

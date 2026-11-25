@@ -10,7 +10,7 @@ use crate::messages::{
     ColumnDesc, ErrorFields, FormatCode, TxStatus, backend_tag, broadcast, decode_command_complete,
     decode_data_row, decode_ready_for_query, decode_row_description,
 };
-use crate::turn::{DescribeTarget, ResultShape};
+use crate::turn::{DescribeTarget, FlushStep, ResultShape};
 use crate::values::render_value;
 
 /// Number of leading rows whose values are retained for reporting.
@@ -61,10 +61,27 @@ impl TurnResponse {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            if self.row_count > 1 {
-                return format!("returns {values} (+{} rows)", self.row_count - 1);
+            let mut summary = if self.row_count > 1 {
+                format!("returns {values} (+{} rows)", self.row_count - 1)
+            } else {
+                format!("returns {values}")
+            };
+            if self.command_tags.len() > 1 {
+                let extra: Vec<&str> = self
+                    .command_tags
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|t| !t.starts_with("SELECT"))
+                    .collect();
+                if !extra.is_empty() {
+                    summary.push_str("; ");
+                    summary.push_str(&extra.join("; "));
+                }
             }
-            return format!("returns {values}");
+            return summary;
+        }
+        if self.command_tags.len() > 1 {
+            return self.command_tags.join("; ");
         }
         if self.row_count == 0
             && self
@@ -86,10 +103,14 @@ pub struct ResponseCollector {
     pending_describes: VecDeque<DescribeTarget>,
     described: Vec<(DescribeTarget, Vec<ColumnDesc>)>,
     result_shapes: VecDeque<ResultShape>,
+    flush_steps: VecDeque<FlushStep>,
     statement_layouts: HashMap<String, Vec<ColumnDesc>>,
     portal_layouts: HashMap<String, PortalLayout>,
     /// Result formats requested by a single `Bind` when used standalone.
     bind_formats: Option<Vec<FormatCode>>,
+    parse_ok: usize,
+    bind_ok: usize,
+    close_ok: usize,
 }
 
 impl ResponseCollector {
@@ -126,6 +147,12 @@ impl ResponseCollector {
         self
     }
 
+    /// Queues the expected server responses for a `Flush`-terminated turn.
+    pub fn with_flush_steps(mut self, steps: VecDeque<FlushStep>) -> Self {
+        self.flush_steps = steps;
+        self
+    }
+
     /// Seeds cached statement and portal column layouts from earlier turns.
     pub(crate) fn with_layouts(
         mut self,
@@ -147,6 +174,24 @@ impl ResponseCollector {
     /// aborted the pipeline).
     pub fn pending_describes_done(&self) -> bool {
         self.pending_describes.is_empty()
+    }
+
+    /// True once every expected response of a `Flush` turn has arrived (or an
+    /// error aborted the pipeline).
+    pub fn flush_done(&self) -> bool {
+        self.flush_steps.is_empty()
+    }
+
+    pub fn parse_ok(&self) -> usize {
+        self.parse_ok
+    }
+
+    pub fn bind_ok(&self) -> usize {
+        self.bind_ok
+    }
+
+    pub fn close_ok(&self) -> usize {
+        self.close_ok
     }
 
     fn resolve_column(&self, i: usize) -> (String, u32, FormatCode) {
@@ -187,6 +232,24 @@ impl ResponseCollector {
     /// Observes one backend frame. Returns `true` on `ReadyForQuery`.
     pub fn observe(&mut self, frame: &Frame) -> WireResult<bool> {
         match frame.tag {
+            backend_tag::PARSE_COMPLETE => {
+                self.parse_ok += 1;
+                if self.flush_steps.front() == Some(&FlushStep::ParseComplete) {
+                    self.flush_steps.pop_front();
+                }
+            }
+            backend_tag::BIND_COMPLETE => {
+                self.bind_ok += 1;
+                if self.flush_steps.front() == Some(&FlushStep::BindComplete) {
+                    self.flush_steps.pop_front();
+                }
+            }
+            backend_tag::CLOSE_COMPLETE => {
+                self.close_ok += 1;
+                if self.flush_steps.front() == Some(&FlushStep::CloseComplete) {
+                    self.flush_steps.pop_front();
+                }
+            }
             backend_tag::ROW_DESCRIPTION => {
                 let raw_cols = decode_row_description(frame)?;
                 if let Some(target) = self.pending_describes.pop_front() {
@@ -201,6 +264,12 @@ impl ResponseCollector {
                         }
                     }
                     self.described.push((target, raw_cols.clone()));
+                }
+                if matches!(
+                    self.flush_steps.front(),
+                    Some(FlushStep::DescribeStatement | FlushStep::DescribePortal)
+                ) {
+                    self.flush_steps.pop_front();
                 }
                 self.columns = raw_cols;
                 let active_formats = self
@@ -232,6 +301,12 @@ impl ResponseCollector {
                 } else {
                     self.columns.clear();
                 }
+                if matches!(
+                    self.flush_steps.front(),
+                    Some(FlushStep::DescribeStatement | FlushStep::DescribePortal)
+                ) {
+                    self.flush_steps.pop_front();
+                }
             }
             backend_tag::DATA_ROW => {
                 self.response.row_count += 1;
@@ -253,9 +328,15 @@ impl ResponseCollector {
                     .command_tags
                     .push(decode_command_complete(frame)?);
                 self.result_shapes.pop_front();
+                if self.flush_steps.front() == Some(&FlushStep::Execute) {
+                    self.flush_steps.pop_front();
+                }
             }
             backend_tag::EMPTY_QUERY | backend_tag::PORTAL_SUSPENDED => {
                 self.result_shapes.pop_front();
+                if self.flush_steps.front() == Some(&FlushStep::Execute) {
+                    self.flush_steps.pop_front();
+                }
             }
             backend_tag::ERROR_RESPONSE => {
                 if self.response.error.is_none() {
@@ -263,6 +344,7 @@ impl ResponseCollector {
                 }
                 self.pending_describes.clear();
                 self.result_shapes.clear();
+                self.flush_steps.clear();
             }
             backend_tag::READY_FOR_QUERY => {
                 self.response.tx_status = Some(decode_ready_for_query(frame)?);

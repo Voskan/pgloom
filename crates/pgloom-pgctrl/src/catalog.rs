@@ -65,6 +65,9 @@ pub struct SchemaCatalog {
     pub links: Vec<CatalogLink>,
     /// Names (lowercase) of volatile functions outside the system schemas.
     pub volatile_functions: Vec<String>,
+    /// Names (lowercase) of user-schema `STABLE` functions (or non-C/internal
+    /// `IMMUTABLE` functions) that may `SELECT` from arbitrary tables.
+    pub stable_functions: Vec<String>,
 }
 
 const USER_NAMESPACE: &str = "n.nspname NOT IN ('pg_catalog', 'information_schema', '_pgloom_snap') \
@@ -143,23 +146,38 @@ impl PgControl {
         let rows = client
             .query(
                 &format!(
-                    "SELECT DISTINCT lower(p.proname::text) FROM pg_proc p \
+                    "SELECT DISTINCT lower(p.proname::text), p.provolatile::text \
+                     FROM pg_proc p \
                      JOIN pg_namespace n ON n.oid = p.pronamespace \
-                     WHERE p.provolatile = 'v' AND {USER_NAMESPACE} ORDER BY 1"
+                     JOIN pg_language l ON l.oid = p.prolang \
+                     WHERE (p.provolatile IN ('v', 's') \
+                            OR (p.provolatile = 'i' AND l.lanname NOT IN ('internal', 'c'))) \
+                       AND {USER_NAMESPACE} \
+                     ORDER BY 1, 2"
                 ),
                 &[],
             )
             .await
             .map_err(PgCtrlError::query("reading user functions"))?;
-        let volatile_functions = rows
-            .iter()
-            .map(|r| r.col(0, "reading user functions"))
-            .collect::<PgCtrlResult<_>>()?;
+        let mut volatile_functions = Vec::new();
+        let mut stable_functions = Vec::new();
+        for r in &rows {
+            let name: String = r.col(0, "reading user functions")?;
+            let vol: &str = r.col(1, "reading user functions")?;
+            if vol == "v" {
+                if !volatile_functions.contains(&name) {
+                    volatile_functions.push(name);
+                }
+            } else if !stable_functions.contains(&name) {
+                stable_functions.push(name);
+            }
+        }
 
         Ok(SchemaCatalog {
             relations,
             links,
             volatile_functions,
+            stable_functions,
         })
     }
 }

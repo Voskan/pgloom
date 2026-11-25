@@ -10,13 +10,74 @@ use std::collections::{HashMap, VecDeque};
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
-use crate::classify::{StatementKind, TurnMeta, classify_sql, is_copy_sql};
+use crate::classify::{
+    SessionSqlOp, StatementKind, TurnMeta, classify_sql, is_copy_sql, session_sql_ops,
+};
 use crate::error::WireResult;
 use crate::frame::Frame;
 use crate::messages::{
     BindMessage, ExecuteMessage, FormatCode, ObjectRef, ParseMessage, decode_query, tag,
 };
 use crate::values::render_value;
+
+/// Expected backend response step for an extended-query `Flush` turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushStep {
+    ParseComplete,
+    BindComplete,
+    CloseComplete,
+    DescribeStatement,
+    DescribePortal,
+    Execute,
+}
+
+/// Reversible mutation applied to [`PreparedStatementRegistry`] during a turn,
+/// used to roll back optimistic updates if PostgreSQL rejects the turn.
+#[derive(Debug, Clone)]
+pub struct RegistryRollback {
+    ops: Vec<RegistryOp>,
+}
+
+impl RegistryRollback {
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RegistryOp {
+    Parse {
+        index: usize,
+        name: String,
+        previous: Option<PreparedStatement>,
+    },
+    Bind {
+        index: usize,
+        name: String,
+        previous: Option<Portal>,
+    },
+    CloseStatement {
+        index: usize,
+        name: String,
+        previous: Option<PreparedStatement>,
+    },
+    ClosePortal {
+        index: usize,
+        name: String,
+        previous: Option<Portal>,
+    },
+    SqlClearStatements {
+        previous: HashMap<String, PreparedStatement>,
+    },
+    SqlDeallocate {
+        name: String,
+        previous: Option<PreparedStatement>,
+    },
+    SqlPrepare {
+        name: String,
+        previous: Option<PreparedStatement>,
+    },
+}
 
 /// A statement that a turn actually executes, with rendered parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +112,10 @@ pub enum Terminator {
     /// `CopyOutResponse` before sending `CopyData` and the closing `Sync` that
     /// produces `ReadyForQuery`.
     CopyFlush,
+    /// `'H'` after one or more non-COPY `Execute` messages (e.g. cursor/portal
+    /// fetches with `max_rows > 0` or pipeline mode): no `ReadyForQuery`
+    /// follows, but the turn executes SQL and is gated by the scheduler.
+    ExecuteFlush,
     /// `'H'` with no pending `Execute`: responses are flushed, no `ReadyForQuery`.
     Flush,
     /// `'X'`: the client is closing the connection.
@@ -63,6 +128,16 @@ impl Terminator {
             self,
             Terminator::Query | Terminator::Sync | Terminator::FunctionCall | Terminator::CopyFlush
         )
+    }
+
+    /// True when the turn may be held at the scheduler gate.
+    pub fn is_schedulable(self) -> bool {
+        self.expects_ready_for_query() || self == Terminator::ExecuteFlush
+    }
+
+    /// True when the turn ends with `Flush` rather than `ReadyForQuery`.
+    pub fn is_flush_pipeline(self) -> bool {
+        matches!(self, Terminator::Flush | Terminator::ExecuteFlush)
     }
 }
 
@@ -78,10 +153,16 @@ pub struct WireTurn {
     pub describes: VecDeque<DescribeTarget>,
     /// Portal, statement and result formats of each `Execute` in wire order.
     pub result_shapes: VecDeque<ResultShape>,
+    /// Expected backend responses for a `Flush` / `ExecuteFlush` turn.
+    pub flush_steps: VecDeque<FlushStep>,
     /// Statements re-parsed or closed in this turn (invalidating cached layouts).
     pub reset_statements: Vec<String>,
     /// Portals re-bound or closed in this turn (invalidating cached layouts).
     pub reset_portals: Vec<String>,
+    /// True when SQL `DISCARD ALL` / `DISCARD PLANS` / `DEALLOCATE ALL` ran.
+    pub clear_all_statements: bool,
+    /// Reversible registry mutations applied when assembling this turn.
+    pub rollback: RegistryRollback,
 }
 
 /// How the rows of an executed portal are encoded, as requested by `Bind`.
@@ -106,7 +187,7 @@ impl WireTurn {
 /// Output of the assembler.
 #[derive(Debug, Clone)]
 pub enum ClientUnit {
-    Turn(WireTurn),
+    Turn(Box<WireTurn>),
     /// `CopyData`/`CopyDone`/`CopyFail`, which belong to an in-flight turn.
     CopyFrame(Frame),
 }
@@ -122,6 +203,7 @@ struct Portal {
     sql: String,
     params: Vec<String>,
     shape: ResultShape,
+    known: bool,
 }
 
 /// Per-connection cache of prepared statements and portals.
@@ -148,22 +230,23 @@ impl PreparedStatementRegistry {
         self.statements.is_empty()
     }
 
-    fn on_parse(&mut self, msg: ParseMessage) {
+    fn on_parse(&mut self, msg: ParseMessage) -> Option<PreparedStatement> {
         self.statements.insert(
             msg.statement,
             PreparedStatement {
                 sql: msg.sql,
                 param_types: msg.param_types,
             },
-        );
+        )
     }
 
-    fn on_bind(&mut self, msg: &BindMessage) {
-        let (sql, types) = match self.statements.get(&msg.statement) {
-            Some(s) => (s.sql.clone(), s.param_types.as_slice()),
+    fn on_bind(&mut self, msg: &BindMessage) -> Option<Portal> {
+        let (sql, types, known) = match self.statements.get(&msg.statement) {
+            Some(s) => (s.sql.clone(), s.param_types.as_slice(), true),
             None => (
                 format!("<unknown prepared statement \"{}\">", msg.statement),
                 &[][..],
+                false,
             ),
         };
         let params = msg
@@ -180,16 +263,42 @@ impl PreparedStatementRegistry {
             statement: msg.statement.clone(),
             formats: msg.result_formats.clone(),
         };
-        self.portals
-            .insert(msg.portal.clone(), Portal { sql, params, shape });
+        self.portals.insert(
+            msg.portal.clone(),
+            Portal {
+                sql,
+                params,
+                shape,
+                known,
+            },
+        )
     }
 
-    fn on_close(&mut self, target: ObjectRef) {
-        match target {
-            ObjectRef::Statement(name) => {
+    fn on_close_statement(&mut self, name: &str) -> Option<PreparedStatement> {
+        self.statements.remove(name)
+    }
+
+    fn on_close_portal(&mut self, name: &str) -> Option<Portal> {
+        self.portals.remove(name)
+    }
+
+    fn restore_statement(&mut self, name: String, previous: Option<PreparedStatement>) {
+        match previous {
+            Some(prev) => {
+                self.statements.insert(name, prev);
+            }
+            None => {
                 self.statements.remove(&name);
             }
-            ObjectRef::Portal(name) => {
+        }
+    }
+
+    fn restore_portal(&mut self, name: String, previous: Option<Portal>) {
+        match previous {
+            Some(prev) => {
+                self.portals.insert(name, prev);
+            }
+            None => {
                 self.portals.remove(&name);
             }
         }
@@ -214,8 +323,14 @@ pub struct TurnAssembler {
     awaiting_copy_sync: bool,
     describes: VecDeque<DescribeTarget>,
     result_shapes: VecDeque<ResultShape>,
+    flush_steps: VecDeque<FlushStep>,
     reset_statements: Vec<String>,
     reset_portals: Vec<String>,
+    clear_all_statements: bool,
+    rollback_ops: Vec<RegistryOp>,
+    parse_count: usize,
+    bind_count: usize,
+    close_count: usize,
 }
 
 impl TurnAssembler {
@@ -230,6 +345,89 @@ impl TurnAssembler {
     /// True when frames are buffered without a terminator yet.
     pub fn has_pending(&self) -> bool {
         self.pending_frames > 0
+    }
+
+    /// Reverts optimistic prepared-statement / portal updates for operations
+    /// that did not complete before an `ErrorResponse`.
+    pub fn rollback(
+        &mut self,
+        rollback: RegistryRollback,
+        parse_ok: usize,
+        bind_ok: usize,
+        close_ok: usize,
+        sql_failed: bool,
+    ) {
+        for op in rollback.ops.into_iter().rev() {
+            match op {
+                RegistryOp::Parse {
+                    index,
+                    name,
+                    previous,
+                } if index >= parse_ok => {
+                    self.registry.restore_statement(name, previous);
+                }
+                RegistryOp::Bind {
+                    index,
+                    name,
+                    previous,
+                } if index >= bind_ok => {
+                    self.registry.restore_portal(name, previous);
+                }
+                RegistryOp::CloseStatement {
+                    index,
+                    name,
+                    previous,
+                } if index >= close_ok => {
+                    self.registry.restore_statement(name, previous);
+                }
+                RegistryOp::ClosePortal {
+                    index,
+                    name,
+                    previous,
+                } if index >= close_ok => {
+                    self.registry.restore_portal(name, previous);
+                }
+                RegistryOp::SqlClearStatements { previous } if sql_failed => {
+                    self.registry.statements = previous;
+                }
+                RegistryOp::SqlDeallocate { name, previous } if sql_failed => {
+                    self.registry.restore_statement(name, previous);
+                }
+                RegistryOp::SqlPrepare { name, previous } if sql_failed => {
+                    self.registry.restore_statement(name, previous);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn apply_session_sql(&mut self, sql: &str) {
+        for op in session_sql_ops(sql) {
+            match op {
+                SessionSqlOp::ClearStatements => {
+                    let previous = std::mem::take(&mut self.registry.statements);
+                    self.clear_all_statements = true;
+                    self.rollback_ops
+                        .push(RegistryOp::SqlClearStatements { previous });
+                }
+                SessionSqlOp::DeallocateStatement(name) => {
+                    let previous = self.registry.on_close_statement(&name);
+                    self.reset_statements.push(name.clone());
+                    self.rollback_ops
+                        .push(RegistryOp::SqlDeallocate { name, previous });
+                }
+                SessionSqlOp::PrepareStatement { name, sql } => {
+                    let previous = self.registry.on_parse(ParseMessage {
+                        statement: name.clone(),
+                        sql,
+                        param_types: Vec::new(),
+                    });
+                    self.reset_statements.push(name.clone());
+                    self.rollback_ops
+                        .push(RegistryOp::SqlPrepare { name, previous });
+                }
+            }
+        }
     }
 
     /// Feeds one client frame; returns a unit once one is complete.
@@ -251,11 +449,16 @@ impl TurnAssembler {
                 tag::FLUSH => return Ok(Some(ClientUnit::CopyFrame(frame))),
                 tag::CLOSE => {
                     let target = ObjectRef::decode(&frame)?;
-                    match &target {
-                        ObjectRef::Statement(name) => self.reset_statements.push(name.clone()),
-                        ObjectRef::Portal(name) => self.reset_portals.push(name.clone()),
+                    match target {
+                        ObjectRef::Statement(name) => {
+                            self.reset_statements.push(name.clone());
+                            self.registry.on_close_statement(&name);
+                        }
+                        ObjectRef::Portal(name) => {
+                            self.reset_portals.push(name.clone());
+                            self.registry.on_close_portal(&name);
+                        }
                     }
-                    self.registry.on_close(target);
                     return Ok(Some(ClientUnit::CopyFrame(frame)));
                 }
                 tag::SYNC => {
@@ -269,6 +472,7 @@ impl TurnAssembler {
         match frame.tag {
             tag::QUERY => {
                 let sql = decode_query(&frame)?;
+                self.apply_session_sql(&sql);
                 self.meta.extend(classify_sql(&sql));
                 self.statements.push(BoundStatement {
                     sql,
@@ -279,25 +483,62 @@ impl TurnAssembler {
             }
             tag::PARSE => {
                 let msg = ParseMessage::decode(&frame)?;
-                self.reset_statements.push(msg.statement.clone());
-                self.registry.on_parse(msg);
+                let name = msg.statement.clone();
+                self.reset_statements.push(name.clone());
+                let previous = self.registry.on_parse(msg);
+                let index = self.parse_count;
+                self.parse_count += 1;
+                self.rollback_ops.push(RegistryOp::Parse {
+                    index,
+                    name,
+                    previous,
+                });
+                self.flush_steps.push_back(FlushStep::ParseComplete);
             }
             tag::BIND => {
                 let msg = BindMessage::decode(&frame)?;
-                self.reset_portals.push(msg.portal.clone());
-                self.registry.on_bind(&msg);
+                let name = msg.portal.clone();
+                self.reset_portals.push(name.clone());
+                let previous = self.registry.on_bind(&msg);
+                let index = self.bind_count;
+                self.bind_count += 1;
+                self.rollback_ops.push(RegistryOp::Bind {
+                    index,
+                    name,
+                    previous,
+                });
+                self.flush_steps.push_back(FlushStep::BindComplete);
             }
             tag::CLOSE => {
                 let target = ObjectRef::decode(&frame)?;
-                match &target {
-                    ObjectRef::Statement(name) => self.reset_statements.push(name.clone()),
-                    ObjectRef::Portal(name) => self.reset_portals.push(name.clone()),
+                let index = self.close_count;
+                self.close_count += 1;
+                match target {
+                    ObjectRef::Statement(name) => {
+                        self.reset_statements.push(name.clone());
+                        let previous = self.registry.on_close_statement(&name);
+                        self.rollback_ops.push(RegistryOp::CloseStatement {
+                            index,
+                            name,
+                            previous,
+                        });
+                    }
+                    ObjectRef::Portal(name) => {
+                        self.reset_portals.push(name.clone());
+                        let previous = self.registry.on_close_portal(&name);
+                        self.rollback_ops.push(RegistryOp::ClosePortal {
+                            index,
+                            name,
+                            previous,
+                        });
+                    }
                 }
-                self.registry.on_close(target);
+                self.flush_steps.push_back(FlushStep::CloseComplete);
             }
             tag::DESCRIBE => match ObjectRef::decode(&frame)? {
                 ObjectRef::Statement(name) => {
                     self.describes.push_back(DescribeTarget::Statement(name));
+                    self.flush_steps.push_back(FlushStep::DescribeStatement);
                 }
                 ObjectRef::Portal(portal) => {
                     let statement = self
@@ -306,21 +547,32 @@ impl TurnAssembler {
                         .map(|p| p.shape.statement.clone());
                     self.describes
                         .push_back(DescribeTarget::Portal { portal, statement });
+                    self.flush_steps.push_back(FlushStep::DescribePortal);
                 }
             },
             tag::EXECUTE => {
                 let msg = ExecuteMessage::decode(&frame)?;
                 self.has_execute = true;
+                self.flush_steps.push_back(FlushStep::Execute);
                 match self.registry.portal(&msg.portal) {
                     Some(portal) => {
                         let sql = portal.sql.clone();
                         let params = portal.params.clone();
                         let shape = portal.shape.clone();
-                        if is_copy_sql(&sql) {
-                            self.has_copy_execute = true;
-                        }
+                        let known = portal.known;
                         self.result_shapes.push_back(shape);
-                        self.meta.extend(classify_sql(&sql));
+                        if known {
+                            if is_copy_sql(&sql) {
+                                self.has_copy_execute = true;
+                            }
+                            self.apply_session_sql(&sql);
+                            self.meta.extend(classify_sql(&sql));
+                        } else {
+                            self.meta.push(StatementKind::DataWrite {
+                                target_tables: Vec::new(),
+                                opaque: true,
+                            });
+                        }
                         self.statements.push(BoundStatement { sql, params });
                     }
                     None => {
@@ -363,9 +615,16 @@ impl TurnAssembler {
                 self.awaiting_copy_sync = true;
                 return Ok(Some(self.finish(Terminator::CopyFlush)));
             }
-            tag::FLUSH if !self.has_execute => {
-                // Describe-before-Sync round trips (e.g. JDBC) must not wait for
-                // a Sync the client will only send after seeing the response.
+            tag::FLUSH if self.has_execute => {
+                // Portal-chunked fetches (`pgjdbc` fetchSize, `asyncpg` cursors)
+                // and pipeline flushes wait for DataRow / PortalSuspended before
+                // sending the next Execute or Sync.
+                self.append(&frame);
+                return Ok(Some(self.finish(Terminator::ExecuteFlush)));
+            }
+            tag::FLUSH => {
+                // Describe-before-Sync round trips (e.g. JDBC / asyncpg) must
+                // not wait for a Sync the client will only send after reading.
                 self.append(&frame);
                 return Ok(Some(self.finish(Terminator::Flush)));
             }
@@ -385,6 +644,12 @@ impl TurnAssembler {
         if meta.statements.is_empty() {
             meta.push(StatementKind::Noise);
         }
+        let flush_steps = if terminator.is_flush_pipeline() {
+            std::mem::take(&mut self.flush_steps)
+        } else {
+            self.flush_steps.clear();
+            VecDeque::new()
+        };
         let turn = WireTurn {
             raw: self.pending.split().freeze(),
             frame_count: std::mem::take(&mut self.pending_frames),
@@ -393,13 +658,21 @@ impl TurnAssembler {
             meta,
             describes: std::mem::take(&mut self.describes),
             result_shapes: std::mem::take(&mut self.result_shapes),
+            flush_steps,
             reset_statements: std::mem::take(&mut self.reset_statements),
             reset_portals: std::mem::take(&mut self.reset_portals),
+            clear_all_statements: std::mem::take(&mut self.clear_all_statements),
+            rollback: RegistryRollback {
+                ops: std::mem::take(&mut self.rollback_ops),
+            },
         };
         self.last_turn_extended_copy = terminator == Terminator::Sync && self.has_copy_execute;
         self.has_execute = false;
         self.has_copy_execute = false;
-        ClientUnit::Turn(turn)
+        self.parse_count = 0;
+        self.bind_count = 0;
+        self.close_count = 0;
+        ClientUnit::Turn(Box::new(turn))
     }
 }
 
@@ -743,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_after_execute_keeps_buffering_until_sync() {
+    fn flush_after_execute_emits_schedulable_execute_flush_turn() {
         let mut asm = TurnAssembler::new();
         let units = feed(
             &mut asm,
@@ -754,9 +1027,23 @@ mod tests {
                 Frame::new(tag::FLUSH, Bytes::new()),
             ],
         );
-        assert!(units.is_empty());
-        let units = feed(&mut asm, &[build::sync()]);
-        assert_eq!(turn(&units[0]).frame_count, 5);
+        assert_eq!(units.len(), 1);
+        let t = turn(&units[0]);
+        assert_eq!(t.terminator, Terminator::ExecuteFlush);
+        assert!(t.terminator.is_schedulable());
+        assert!(!t.terminator.expects_ready_for_query());
+        assert_eq!(t.frame_count, 4);
+        assert_eq!(
+            t.flush_steps,
+            VecDeque::from([
+                FlushStep::ParseComplete,
+                FlushStep::BindComplete,
+                FlushStep::Execute,
+            ])
+        );
+        let sync = feed(&mut asm, &[build::sync()]);
+        assert_eq!(turn(&sync[0]).terminator, Terminator::Sync);
+        assert!(turn(&sync[0]).meta.is_noise());
     }
 
     #[test]

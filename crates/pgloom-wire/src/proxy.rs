@@ -32,7 +32,8 @@ use crate::messages::{
 };
 use crate::response::{PortalLayout, ResponseCollector, TurnResponse};
 use crate::turn::{
-    BoundStatement, ClientUnit, DescribeTarget, ResultShape, Terminator, TurnAssembler, WireTurn,
+    BoundStatement, ClientUnit, DescribeTarget, FlushStep, RegistryRollback, ResultShape,
+    Terminator, TurnAssembler, WireTurn,
 };
 
 /// Identifier of a proxied client connection, unique per proxy instance.
@@ -251,15 +252,26 @@ struct Expectation {
     gated: Option<EventTx>,
     describes: VecDeque<DescribeTarget>,
     result_shapes: VecDeque<ResultShape>,
+    flush_steps: VecDeque<FlushStep>,
     reset_statements: Vec<String>,
     reset_portals: Vec<String>,
-    /// A `Describe`-then-`Flush` round trip: complete once every queued
-    /// object's row layout (or an error) arrives, since no `ReadyForQuery`
-    /// follows.
-    describe_only: bool,
+    clear_all_statements: bool,
+    /// A `Flush` or `ExecuteFlush` round trip: completes once every queued
+    /// protocol step (or an error) arrives, since no `ReadyForQuery` follows.
+    is_flush_pipeline: bool,
     /// An `Execute("COPY ...")`-then-`Flush` round trip: stream errors as well
     /// as `CopyInResponse` / `CopyOutResponse` so the client sends `Sync`.
     is_copy_flush: bool,
+}
+
+/// Completion report sent from the server relay back to the client relay once
+/// an [`Expectation`] finishes.
+#[derive(Debug, Clone, Copy)]
+struct TurnDone {
+    had_error: bool,
+    parse_ok: usize,
+    bind_ok: usize,
+    close_ok: usize,
 }
 
 async fn run_session(
@@ -377,7 +389,7 @@ struct ClientCtx<'a> {
     backend_pid: Option<BackendPid>,
     shared: &'a Shared,
     expect_tx: mpsc::UnboundedSender<Expectation>,
-    done_rx: mpsc::UnboundedReceiver<()>,
+    done_rx: mpsc::UnboundedReceiver<TurnDone>,
 }
 
 /// A turn waiting for its permit.
@@ -389,7 +401,7 @@ struct Held {
 }
 
 fn should_gate(turn: &WireTurn, status: TxStatus) -> bool {
-    if !turn.terminator.expects_ready_for_query() || turn.meta.is_noise() {
+    if !turn.terminator.is_schedulable() || turn.meta.is_noise() {
         return false;
     }
     // A stray COMMIT/ROLLBACK outside a transaction block (pool hygiene) is a no-op.
@@ -404,7 +416,8 @@ async fn relay_client(
     let mut assembler = TurnAssembler::new();
     let mut queue: VecDeque<ClientUnit> = VecDeque::new();
     let mut held: Option<Held> = None;
-    let mut awaiting_response = false;
+    let mut in_flight: usize = 0;
+    let mut in_flight_rollbacks: VecDeque<(RegistryRollback, bool)> = VecDeque::new();
     let mut pending_resets = PendingResets::default();
     let mut seq: u64 = 0;
 
@@ -417,10 +430,11 @@ async fn relay_client(
                     };
                     swr.write_all(&frame.to_bytes()).await?;
                 }
-                Some(ClientUnit::Turn(_)) if !awaiting_response => {
+                Some(ClientUnit::Turn(_)) if in_flight == 0 => {
                     let Some(ClientUnit::Turn(turn)) = queue.pop_front() else {
                         unreachable!();
                     };
+                    let turn = *turn;
                     seq += 1;
                     let status = ctx.shared.tx_status();
                     let events = ctx.gate.sender().filter(|_| should_gate(&turn, status));
@@ -448,7 +462,10 @@ async fn relay_client(
                                     permit: permit_rx,
                                 });
                             } else {
-                                forward(
+                                let is_sql = turn.terminator == Terminator::Query
+                                    || !turn.statements.is_empty();
+                                let rollback = turn.rollback.clone();
+                                if forward(
                                     &mut swr,
                                     &ctx.expect_tx,
                                     &mut pending_resets,
@@ -456,12 +473,19 @@ async fn relay_client(
                                     seq,
                                     None,
                                 )
-                                .await?;
+                                .await?
+                                {
+                                    in_flight += 1;
+                                    in_flight_rollbacks.push_back((rollback, is_sql));
+                                }
                             }
                         }
                         None => {
                             let terminate = turn.terminator == Terminator::Terminate;
-                            forward(
+                            let is_sql =
+                                turn.terminator == Terminator::Query || !turn.statements.is_empty();
+                            let rollback = turn.rollback.clone();
+                            if forward(
                                 &mut swr,
                                 &ctx.expect_tx,
                                 &mut pending_resets,
@@ -469,7 +493,11 @@ async fn relay_client(
                                 seq,
                                 None,
                             )
-                            .await?;
+                            .await?
+                            {
+                                in_flight += 1;
+                                in_flight_rollbacks.push_back((rollback, is_sql));
+                            }
                             if terminate {
                                 return Ok(());
                             }
@@ -497,8 +525,10 @@ async fn relay_client(
                 // A dropped permit means the controller abandoned the episode:
                 // forward the turn unsupervised.
                 let events = granted.ok().map(|()| h.events);
-                awaiting_response = events.is_some();
-                forward(
+                let is_sql =
+                    h.turn.terminator == Terminator::Query || !h.turn.statements.is_empty();
+                let rollback = h.turn.rollback.clone();
+                if forward(
                     &mut swr,
                     &ctx.expect_tx,
                     &mut pending_resets,
@@ -506,11 +536,29 @@ async fn relay_client(
                     h.seq,
                     events,
                 )
-                .await?;
+                .await?
+                {
+                    in_flight += 1;
+                    in_flight_rollbacks.push_back((rollback, is_sql));
+                }
             }
             done = ctx.done_rx.recv() => {
                 match done {
-                    Some(()) => awaiting_response = false,
+                    Some(done) => {
+                        in_flight = in_flight.saturating_sub(1);
+                        if let Some((rollback, is_sql)) = in_flight_rollbacks.pop_front()
+                            && done.had_error
+                            && !rollback.is_empty()
+                        {
+                            assembler.rollback(
+                                rollback,
+                                done.parse_ok,
+                                done.bind_ok,
+                                done.close_ok,
+                                is_sql,
+                            );
+                        }
+                    }
                     None => return Ok(()),
                 }
             }
@@ -522,8 +570,11 @@ async fn relay_client(
 struct PendingResets {
     statements: Vec<String>,
     portals: Vec<String>,
+    clear_all_statements: bool,
 }
 
+/// Forwards `turn` to the upstream server. Returns `true` when an
+/// [`Expectation`] was registered on `expect_tx`.
 async fn forward(
     swr: &mut OwnedWriteHalf,
     expect_tx: &mpsc::UnboundedSender<Expectation>,
@@ -531,15 +582,14 @@ async fn forward(
     turn: WireTurn,
     seq: u64,
     gated: Option<EventTx>,
-) -> WireResult<()> {
+) -> WireResult<bool> {
     pending_resets.statements.extend(turn.reset_statements);
     pending_resets.portals.extend(turn.reset_portals);
-    // Drivers such as asyncpg and JDBC prepare with Parse/Describe/Flush and
-    // only later Bind the statement; its row layout must be learned here or
-    // those rows cannot be decoded.
-    let describe_only = turn.terminator == Terminator::Flush && !turn.describes.is_empty();
+    pending_resets.clear_all_statements |= turn.clear_all_statements;
+    let is_flush_pipeline = turn.terminator.is_flush_pipeline() && !turn.flush_steps.is_empty();
     let is_copy_flush = turn.terminator == Terminator::CopyFlush;
-    if turn.terminator.expects_ready_for_query() || describe_only {
+    let registered = turn.terminator.expects_ready_for_query() || is_flush_pipeline;
+    if registered {
         // Must be registered before the bytes leave, so the response can never
         // overtake its expectation.
         let _ = expect_tx.send(Expectation {
@@ -547,14 +597,16 @@ async fn forward(
             gated,
             describes: turn.describes,
             result_shapes: turn.result_shapes,
+            flush_steps: turn.flush_steps,
             reset_statements: std::mem::take(&mut pending_resets.statements),
             reset_portals: std::mem::take(&mut pending_resets.portals),
-            describe_only,
+            clear_all_statements: std::mem::take(&mut pending_resets.clear_all_statements),
+            is_flush_pipeline,
             is_copy_flush,
         });
     }
     swr.write_all(&turn.raw).await?;
-    Ok(())
+    Ok(registered)
 }
 
 struct InFlight {
@@ -562,13 +614,15 @@ struct InFlight {
     collector: ResponseCollector,
     held: BytesMut,
     streaming: bool,
+    saved_statements: Vec<(String, Vec<ColumnDesc>)>,
+    saved_all_statements: Option<HashMap<String, Vec<ColumnDesc>>>,
 }
 
 async fn relay_server(
     mut sreader: FrameReader<OwnedReadHalf>,
     mut cwr: OwnedWriteHalf,
     mut expect_rx: mpsc::UnboundedReceiver<Expectation>,
-    done_tx: mpsc::UnboundedSender<()>,
+    done_tx: mpsc::UnboundedSender<TurnDone>,
     shared: Arc<Shared>,
     conn: ConnId,
 ) -> WireResult<()> {
@@ -587,8 +641,16 @@ async fn relay_server(
         }
         if current.is_none() {
             current = pending.pop_front().map(|expectation| {
+                let saved_all_statements = if expectation.clear_all_statements {
+                    Some(std::mem::take(&mut statement_columns))
+                } else {
+                    None
+                };
+                let mut saved_statements = Vec::new();
                 for stmt in &expectation.reset_statements {
-                    statement_columns.remove(stmt);
+                    if let Some(prev) = statement_columns.remove(stmt) {
+                        saved_statements.push((stmt.clone(), prev));
+                    }
                 }
                 for portal in &expectation.reset_portals {
                     portal_columns.remove(portal);
@@ -606,12 +668,15 @@ async fn relay_server(
                 let collector = ResponseCollector::new()
                     .with_layouts(stmt_layouts, port_layouts)
                     .with_describes(expectation.describes.clone())
-                    .with_result_shapes(expectation.result_shapes.clone());
+                    .with_result_shapes(expectation.result_shapes.clone())
+                    .with_flush_steps(expectation.flush_steps.clone());
                 InFlight {
                     expectation,
                     collector,
                     held: BytesMut::new(),
                     streaming: false,
+                    saved_statements,
+                    saved_all_statements,
                 }
             });
         }
@@ -624,14 +689,7 @@ async fn relay_server(
         };
 
         let is_ready = cur.collector.observe(&frame)?
-            || (cur.expectation.describe_only
-                && matches!(
-                    frame.tag,
-                    backend_tag::ROW_DESCRIPTION
-                        | backend_tag::NO_DATA
-                        | backend_tag::ERROR_RESPONSE
-                )
-                && cur.collector.pending_describes_done());
+            || (cur.expectation.is_flush_pipeline && cur.collector.flush_done());
         let supervised = cur.expectation.gated.is_some();
         if supervised && !cur.streaming {
             frame.encode(&mut cur.held);
@@ -660,6 +718,9 @@ async fn relay_server(
         }
 
         let Some(done) = current.take() else { continue };
+        let parse_ok = done.collector.parse_ok();
+        let bind_ok = done.collector.bind_ok();
+        let close_ok = done.collector.close_ok();
         for (target, cols) in done.collector.described() {
             match target {
                 DescribeTarget::Statement(name) => {
@@ -671,6 +732,15 @@ async fn relay_server(
             }
         }
         let response = done.collector.finish();
+        let had_error = response.error.is_some();
+        if had_error && parse_ok == 0 && close_ok == 0 {
+            if let Some(prev_all) = done.saved_all_statements {
+                statement_columns = prev_all;
+            }
+            for (stmt, cols) in done.saved_statements {
+                statement_columns.insert(stmt, cols);
+            }
+        }
         if let Some(status) = response.tx_status {
             shared.set_tx_status(status);
             portal_columns.remove("");
@@ -678,6 +748,12 @@ async fn relay_server(
                 portal_columns.clear();
             }
         }
+        let report_done = TurnDone {
+            had_error,
+            parse_ok,
+            bind_ok,
+            close_ok,
+        };
         if let Some(events) = done.expectation.gated {
             flush(&mut cwr, &mut out).await?;
             let (release_tx, release_rx) = oneshot::channel();
@@ -693,9 +769,10 @@ async fn relay_server(
             }
             out.extend_from_slice(&done.held);
             flush(&mut cwr, &mut out).await?;
-            let _ = done_tx.send(());
+            let _ = done_tx.send(report_done);
         } else {
             flush_if_drained(&sreader, &mut cwr, &mut out).await?;
+            let _ = done_tx.send(report_done);
         }
     }
     flush(&mut cwr, &mut out).await?;

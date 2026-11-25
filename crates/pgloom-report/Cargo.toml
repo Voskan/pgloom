@@ -16,6 +16,7 @@ pgloom-wire.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 unicode-width.workspace = true
 
@@ -23,7 +24,6 @@ unicode-width.workspace = true
 pgloom-wire.workspace = true
 proptest.workspace = true
 serde_json.workspace = true
-tempfile.workspace = true
 unicode-width.workspace = true
 
 [lints]

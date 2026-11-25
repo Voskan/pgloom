@@ -62,6 +62,9 @@ impl Frame {
     }
 }
 
+/// Maximum bytes reserved per incremental read while waiting for a large frame.
+const MAX_RESERVE_STEP: usize = 64 * 1024;
+
 /// Decodes one tagged message from `src`, or returns `Ok(None)` when more
 /// bytes are needed.
 pub fn decode_frame(src: &mut BytesMut) -> WireResult<Option<Frame>> {
@@ -85,7 +88,7 @@ pub fn decode_frame(src: &mut BytesMut) -> WireResult<Option<Frame>> {
     }
     let total = 1 + len;
     if src.len() < total {
-        src.reserve(total - src.len());
+        src.reserve((total - src.len()).min(MAX_RESERVE_STEP));
         return Ok(None);
     }
     let mut frame = src.split_to(total);

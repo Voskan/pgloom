@@ -142,3 +142,36 @@ fn conflicting_flags_are_usage_errors() {
         .code(2)
         .stderr(predicate::str::contains("cannot be used with"));
 }
+
+#[test]
+fn upstream_override_supersedes_unset_env_var_in_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("pgloom.yaml"),
+        r#"version: 1
+name: env-override
+database:
+  upstream: "${UNSET_CI_DATABASE_URL}"
+  proxy_listen: "${UNSET_CI_LISTEN}"
+workers:
+  - id: a
+    sql: ["SELECT 1"]
+  - id: b
+    sql: ["SELECT 1"]
+"#,
+    )
+    .unwrap();
+    pgloom()
+        .current_dir(dir.path())
+        .args([
+            "doctor",
+            "--upstream",
+            "postgres://u:p@127.0.0.1:1/db",
+            "--listen",
+            "127.0.0.1:0",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("✓ scenario"))
+        .stdout(predicate::str::contains("✗ database"));
+}

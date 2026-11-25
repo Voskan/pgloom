@@ -591,3 +591,545 @@ async fn bypassing_the_proxy_is_an_error_not_a_pass() {
     assert_eq!(err.exit_code(), pgloom_cli::error::EXIT_CONFIG);
     env.finish().await;
 }
+
+/// Under `fail_on_deadlock: false`, PostgreSQL breaks the lock cycle with
+/// genuine SQLSTATE `40P01`, letting a handler that catches `40P01` roll back
+/// and retry to completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fail_on_deadlock_false_lets_postgres_raise_40p01_and_handler_retry() {
+    use axum::Router;
+    use axum::extract::{Json, State};
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use serde::Deserialize;
+    use std::sync::Arc;
+    use tokio_postgres::NoTls;
+
+    #[derive(Deserialize)]
+    struct TransferReq {
+        from: i32,
+        to: i32,
+        amount: i64,
+    }
+
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let proxy = free_port().await.unwrap();
+    let proxy_url = PgUrl::parse(db.url())
+        .unwrap()
+        .with_host_port("127.0.0.1", proxy.port())
+        .with_ssl_disabled()
+        .to_string();
+
+    let state = Arc::new(proxy_url);
+    let app = Router::new()
+        .route(
+            "/transfer",
+            post(
+                |State(url): State<Arc<String>>, Json(req): Json<TransferReq>| async move {
+                    for _attempt in 0..5 {
+                        let Ok((mut client, conn)) = tokio_postgres::connect(&url, NoTls).await
+                        else {
+                            return StatusCode::SERVICE_UNAVAILABLE;
+                        };
+                        let conn_task = tokio::spawn(async move {
+                            let _ = conn.await;
+                        });
+                        let res = async {
+                            let tx = client.transaction().await?;
+                            tx.execute(
+                                "UPDATE wallets SET balance = balance - $1 WHERE id = $2",
+                                &[&req.amount, &req.from],
+                            )
+                            .await?;
+                            tx.execute(
+                                "UPDATE wallets SET balance = balance + $1 WHERE id = $2",
+                                &[&req.amount, &req.to],
+                            )
+                            .await?;
+                            tx.commit().await
+                        }
+                        .await;
+                        drop(client);
+                        conn_task.abort();
+                        match res {
+                            Ok(()) => return StatusCode::OK,
+                            Err(e) if e.code().map(|c| c.code()) == Some("40P01") => continue,
+                            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+                        }
+                    }
+                    StatusCode::CONFLICT
+                },
+            ),
+        )
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let svc_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let yaml = format!(
+        r#"
+version: 1
+name: retry-on-deadlock
+database:
+  upstream: "{upstream}"
+  proxy_listen: "{proxy}"
+  setup_sql: |
+    CREATE TABLE IF NOT EXISTS wallets (id INT PRIMARY KEY, balance BIGINT NOT NULL);
+    TRUNCATE TABLE wallets;
+    INSERT INTO wallets (id, balance) VALUES (1, 100), (2, 100);
+exploration:
+  strategy: bounded
+  max_preemptions: 2
+  max_schedules: 12
+  step_timeout_ms: 5000
+workers:
+  - id: a_to_b
+    http: {{ method: POST, url: "http://{svc_addr}/transfer", headers: {{ Content-Type: application/json }}, body: '{{"from": 1, "to": 2, "amount": 10}}' }}
+  - id: b_to_a
+    http: {{ method: POST, url: "http://{svc_addr}/transfer", headers: {{ Content-Type: application/json }}, body: '{{"from": 2, "to": 1, "amount": 10}}' }}
+invariants:
+  sql:
+    - name: money_is_conserved
+      assert_true: "SELECT SUM(balance) = 200 FROM wallets"
+  responses:
+    - name: both_transfers_succeed
+      min_2xx_count: 2
+  fail_on_deadlock: false
+"#,
+        upstream = db.url(),
+    );
+
+    let session = Session::start(Env::config(&yaml), RunOptions::default())
+        .await
+        .unwrap();
+    let report = session.run().await.unwrap();
+    session.close().await;
+    server.abort();
+    db.cleanup().await;
+
+    assert_eq!(report.outcome, RunOutcome::Pass, "{:?}", report.failures);
+    assert!(report.parks > 0);
+}
+
+/// DPOR must not treat a STABLE user-defined SQL function as pure: it reads
+/// tables hidden inside its body, so concurrent writes to those tables must
+/// not be pruned away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dpor_catches_race_through_stable_sql_function() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let proxy = free_port().await.unwrap();
+    let yaml = format!(
+        r#"
+version: 1
+name: stable-function-dpor
+database:
+  upstream: "{upstream}"
+  proxy_listen: "{proxy}"
+  setup_sql: |
+    CREATE TABLE IF NOT EXISTS wallets (id INT PRIMARY KEY, balance BIGINT NOT NULL);
+    CREATE TABLE IF NOT EXISTS credit_limits (id INT PRIMARY KEY, cap BIGINT NOT NULL);
+    TRUNCATE TABLE wallets, credit_limits;
+    INSERT INTO wallets VALUES (1, 100);
+    INSERT INTO credit_limits VALUES (1, 100);
+    CREATE OR REPLACE FUNCTION active_limit() RETURNS BIGINT
+      LANGUAGE sql STABLE AS $$ SELECT cap FROM credit_limits WHERE id = 1 $$;
+exploration:
+  strategy: exhaustive
+  reduction: dpor
+  max_schedules: 50
+workers:
+  - id: reader
+    sql:
+      - "UPDATE wallets SET balance = active_limit() WHERE id = 1"
+  - id: lower_cap
+    sql:
+      - "UPDATE credit_limits SET cap = 0 WHERE id = 1"
+invariants:
+  sql:
+    - name: balance_stays_at_initial_cap
+      assert_true: "SELECT balance = 100 FROM wallets WHERE id = 1"
+"#,
+        upstream = db.url(),
+    );
+    let session = Session::start(Env::config(&yaml), RunOptions::default())
+        .await
+        .unwrap();
+    let report = session.run().await.unwrap();
+    session.close().await;
+    db.cleanup().await;
+
+    assert!(report.stats.reduced);
+    assert_eq!(
+        report.outcome,
+        RunOutcome::ViolationFound,
+        "DPOR must explore the interleaving where credit_limits changes before active_limit() runs"
+    );
+}
+
+/// Every concrete SQL statement proposed by the Fix Advisor must parse and
+/// plan cleanly in real PostgreSQL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fix_advisor_proposed_sql_is_valid_postgres_syntax() {
+    use pgloom_engine::{DeadlockSource, EpisodeRecord, RecordedStep, StepAction, WorkerId};
+    use pgloom_pgctrl::PgControl;
+
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let ctl = PgControl::connect(db.url()).await.unwrap();
+    ctl.batch(
+        "CREATE TABLE wallets (
+             id INT PRIMARY KEY,
+             ext_id INT,
+             balance BIGINT NOT NULL,
+             status TEXT,
+             updated_at TIMESTAMPTZ
+         );
+         CREATE TABLE holds (
+             id INT PRIMARY KEY,
+             wallet_id INT REFERENCES wallets(id)
+         );
+         CREATE TABLE accounts (
+             id INT PRIMARY KEY,
+             balance BIGINT NOT NULL
+         );",
+        "advisor schema",
+    )
+    .await
+    .unwrap();
+
+    let mk_record = |steps: &[(u32, &str)]| {
+        let mut r = EpisodeRecord::default();
+        for (idx, &(w, sql)) in steps.iter().enumerate() {
+            let mut step = RecordedStep::new(idx as u32, WorkerId(w), StepAction::Execute);
+            step.sql = sql.to_owned();
+            r.steps.push(step);
+        }
+        r
+    };
+    let workers = vec!["req_a".to_owned(), "req_b".to_owned()];
+
+    let cases: Vec<(EpisodeRecord, Vec<Violation>)> = vec![
+        // CheckThenAct with OR predicate
+        (
+            mk_record(&[
+                (0, "SELECT balance FROM wallets WHERE id = $1"),
+                (
+                    0,
+                    "UPDATE wallets SET balance = balance - $1 WHERE id = $2 OR ext_id = $3",
+                ),
+            ]),
+            vec![],
+        ),
+        // CheckThenAct with multi-term subtraction and RETURNING
+        (
+            mk_record(&[
+                (0, "SELECT balance FROM wallets WHERE id = $1"),
+                (
+                    0,
+                    "UPDATE wallets SET balance = balance - $1 - $2 WHERE id = $3 RETURNING balance",
+                ),
+            ]),
+            vec![],
+        ),
+        // CheckThenAct with LEFT JOIN
+        (
+            mk_record(&[
+                (
+                    0,
+                    "SELECT w.balance FROM wallets w LEFT JOIN holds h ON h.wallet_id = w.id WHERE w.id = $1",
+                ),
+                (0, "UPDATE wallets SET balance = balance - $1 WHERE id = $2"),
+            ]),
+            vec![],
+        ),
+        // CheckThenAct with FOR SHARE
+        (
+            mk_record(&[
+                (0, "SELECT balance FROM wallets WHERE id = $1 FOR SHARE"),
+                (0, "UPDATE wallets SET balance = balance - $1 WHERE id = $2"),
+            ]),
+            vec![],
+        ),
+        // LostUpdate with multi-column SET
+        (
+            mk_record(&[
+                (0, "SELECT balance FROM wallets WHERE id = $1"),
+                (
+                    0,
+                    "UPDATE wallets SET balance = $1, status = $2, updated_at = $3 WHERE id = $4",
+                ),
+            ]),
+            vec![],
+        ),
+        // PhantomInsert without ON CONFLICT
+        (
+            mk_record(&[
+                (0, "SELECT count(*) FROM holds WHERE id = $1"),
+                (0, "INSERT INTO holds (id, wallet_id) VALUES ($1, $2)"),
+            ]),
+            vec![],
+        ),
+        // PhantomInsert with existing ON CONFLICT
+        (
+            mk_record(&[
+                (0, "SELECT count(*) FROM holds WHERE id = $1"),
+                (
+                    0,
+                    "INSERT INTO holds (id, wallet_id) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET wallet_id = EXCLUDED.wallet_id",
+                ),
+            ]),
+            vec![],
+        ),
+        // CheckThenAct with window function (must emit separate pre-lock, not FOR UPDATE on OVER)
+        (
+            mk_record(&[
+                (
+                    0,
+                    "SELECT balance, row_number() OVER () FROM wallets WHERE id = $1",
+                ),
+                (0, "UPDATE wallets SET balance = balance - $1 WHERE id = $2"),
+            ]),
+            vec![],
+        ),
+        // LockOrderInversion
+        (
+            EpisodeRecord::default(),
+            vec![Violation::Deadlock {
+                cycle: vec![WorkerId(0), WorkerId(1)],
+                source: DeadlockSource::WaitForGraph,
+                statements: vec![
+                    (
+                        WorkerId(0),
+                        "UPDATE accounts SET balance = balance - 1 WHERE id = 2".into(),
+                    ),
+                    (
+                        WorkerId(1),
+                        "UPDATE accounts SET balance = balance - 1 WHERE id = 1".into(),
+                    ),
+                ],
+            }],
+        ),
+    ];
+
+    let mut checked = 0usize;
+    for (rec, viols) in &cases {
+        let advice = advise(rec, viols, &workers);
+        assert!(!advice.is_empty());
+        for a in &advice {
+            for fix in &a.fixes {
+                for raw_sql in &fix.sql {
+                    let delta_replacement = if raw_sql.contains("$2") && !raw_sql.contains("$1") {
+                        "$1"
+                    } else {
+                        "1"
+                    };
+                    let sql = raw_sql
+                        .replace("<delta>", delta_replacement)
+                        .replace("<value you read>", "100")
+                        .replace("<natural key columns>", "id")
+                        .replace("<natural key>", "'key'")
+                        .replace("<table>", "accounts");
+                    if sql.starts_with("--") || sql.contains("...") {
+                        continue;
+                    }
+                    let upper = sql.to_ascii_uppercase();
+                    if upper.starts_with("CREATE UNIQUE INDEX CONCURRENTLY") {
+                        // CONCURRENTLY cannot run inside a transaction block.
+                        ctl.batch(&sql, "validating advisor CONCURRENTLY index SQL")
+                            .await
+                            .unwrap_or_else(|e| panic!("invalid advisor SQL `{sql}`: {e}"));
+                    } else if upper.starts_with("CREATE ") || upper.starts_with("BEGIN") {
+                        ctl.batch(
+                            &format!("BEGIN; {sql} ROLLBACK;"),
+                            "validating advisor DDL/TX SQL",
+                        )
+                        .await
+                        .unwrap_or_else(|e| panic!("invalid advisor SQL `{sql}`: {e}"));
+                    } else {
+                        let stmt = format!("adv_{checked}");
+                        let clean = sql.trim_end_matches(';');
+                        ctl.batch(
+                            &format!("PREPARE {stmt} AS {clean}; DEALLOCATE {stmt};"),
+                            "validating advisor DML SQL",
+                        )
+                        .await
+                        .unwrap_or_else(|e| panic!("invalid advisor SQL `{sql}`: {e}"));
+                    }
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        checked >= 15,
+        "expected to validate >= 15 SQL patches, checked {checked}"
+    );
+    drop(ctl);
+    db.cleanup().await;
+}
+
+/// `target.reset_http` is invoked after every schedule so services with
+/// in-process caches can clear state alongside the database snapshot restore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn target_reset_http_is_invoked_between_schedules() {
+    use axum::Router;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let proxy = free_port().await.unwrap();
+    let resets = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/reset",
+            post(|State(n): State<Arc<AtomicUsize>>| async move {
+                n.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }),
+        )
+        .with_state(Arc::clone(&resets));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let svc_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let yaml = format!(
+        r#"
+version: 1
+name: reset-http-hook
+database:
+  upstream: "{upstream}"
+  proxy_listen: "{proxy}"
+  setup_sql: |
+    CREATE TABLE IF NOT EXISTS wallets (id INT PRIMARY KEY, balance BIGINT NOT NULL);
+    TRUNCATE TABLE wallets;
+    INSERT INTO wallets VALUES (1, 100);
+target:
+  reset_http: "http://{svc_addr}/reset"
+exploration:
+  strategy: exhaustive
+  reduction: none
+  max_schedules: 4
+workers:
+  - id: a
+    sql: ["UPDATE wallets SET balance = balance + 1 WHERE id = 1"]
+  - id: b
+    sql: ["UPDATE wallets SET balance = balance + 1 WHERE id = 1"]
+invariants:
+  sql:
+    - name: ok
+      assert_true: "SELECT balance = 102 FROM wallets WHERE id = 1"
+"#,
+        upstream = db.url(),
+    );
+
+    let session = Session::start(Env::config(&yaml), RunOptions::default())
+        .await
+        .unwrap();
+    let report = session.run().await.unwrap();
+    session.close().await;
+    server.abort();
+    db.cleanup().await;
+
+    assert_eq!(report.outcome, RunOutcome::Pass);
+    assert!(
+        resets.load(Ordering::SeqCst) >= report.stats.schedules,
+        "expected >= {} reset_http calls, got {}",
+        report.stats.schedules,
+        resets.load(Ordering::SeqCst)
+    );
+}
+
+/// `pgloom doctor` passes the snapshot-schema check when `reset_sql` is
+/// configured even if the database role lacks `CREATE` on the database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn doctor_passes_snapshot_schema_when_reset_sql_set_for_unprivileged_role() {
+    use pgloom_pgctrl::PgControl;
+
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let ctl = PgControl::connect(db.url()).await.unwrap();
+    let role = format!("pgloom_nocreate_{}", std::process::id());
+    ctl.batch(
+        &format!(
+            "DROP ROLE IF EXISTS {role};
+             CREATE ROLE {role} LOGIN PASSWORD 'pw';
+             REVOKE CREATE ON DATABASE \"{}\" FROM PUBLIC;
+             GRANT CONNECT ON DATABASE \"{}\" TO {role};",
+            db.name(),
+            db.name()
+        ),
+        "create restricted role",
+    )
+    .await
+    .unwrap();
+    let role_url = db
+        .url()
+        .replace("postgres:postgres@", &format!("{role}:pw@"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("pgloom.yaml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"version: 1
+name: doctor-reset-sql
+database:
+  upstream: "{role_url}"
+  proxy_listen: "127.0.0.1:0"
+  reset_sql: "SELECT 1;"
+workers:
+  - id: a
+    sql: ["SELECT 1"]
+  - id: b
+    sql: ["SELECT 1"]
+"#
+        ),
+    )
+    .unwrap();
+
+    let cwd = dir.path().to_owned();
+    let out = tokio::task::spawn_blocking(move || {
+        Command::cargo_bin("pgloom")
+            .unwrap()
+            .current_dir(&cwd)
+            .args(["doctor", "--color", "never"])
+            .env_remove("PGLOOM_UPSTREAM_URL")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let _ = ctl
+        .batch(&format!("DROP ROLE IF EXISTS {role};"), "drop role")
+        .await;
+    drop(ctl);
+    db.cleanup().await;
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "doctor should pass when reset_sql is set:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("not needed (database.reset_sql is set)"),
+        "{stdout}"
+    );
+}

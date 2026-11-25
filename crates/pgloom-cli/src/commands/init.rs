@@ -38,6 +38,7 @@ target:
   env:
     DATABASE_URL: "postgres://postgres:postgres@127.0.0.1:15432/app_test?sslmode=disable"
   ready_http: "http://127.0.0.1:8080/healthz"
+  reset_http: null         # optional POST endpoint to clear in-memory caches between schedules
   startup_timeout_ms: 5000
 
 exploration:

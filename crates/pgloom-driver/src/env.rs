@@ -4,6 +4,29 @@
 /// Any other `$` (SQL placeholders such as `$1`, `$$` or `$tag$` quotes) is kept.
 /// Fails listing every referenced variable that is unset and has no default.
 pub fn interpolate(src: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<String, String> {
+    let (out, missing) = interpolate_lenient(src, lookup, |_| String::new())?;
+    if missing.is_empty() {
+        Ok(out)
+    } else {
+        Err(missing_vars_error(&missing))
+    }
+}
+
+pub(crate) fn missing_vars_error(missing: &[String]) -> String {
+    format!(
+        "environment variable(s) not set and without default: {}",
+        missing.join(", ")
+    )
+}
+
+/// Like [`interpolate`], but substitutes unset variables without defaults using
+/// `on_missing(name)` and returns the distinct missing variable names instead
+/// of failing immediately.
+pub(crate) fn interpolate_lenient(
+    src: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+    mut on_missing: impl FnMut(&str) -> String,
+) -> Result<(String, Vec<String>), String> {
     let mut out = String::with_capacity(src.len());
     let mut missing: Vec<String> = Vec::new();
     let mut rest = src;
@@ -45,20 +68,14 @@ pub fn interpolate(src: &str, lookup: impl Fn(&str) -> Option<String>) -> Result
                     if !missing.iter().any(|m| m == name) {
                         missing.push(name.to_owned());
                     }
+                    out.push_str(&on_missing(name));
                 }
             },
         }
         rest = &body_start[end + 1..];
     }
     out.push_str(rest);
-    if missing.is_empty() {
-        Ok(out)
-    } else {
-        Err(format!(
-            "environment variable(s) not set and without default: {}",
-            missing.join(", ")
-        ))
-    }
+    Ok((out, missing))
 }
 
 #[cfg(test)]

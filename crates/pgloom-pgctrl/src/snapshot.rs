@@ -159,6 +159,9 @@ pub struct TableSnapshot {
     /// Insertable (non-generated) columns, in attribute order.
     pub columns: Vec<String>,
     pub has_user_triggers: bool,
+    /// Non-partitioned table with classic `INHERITS` children: queries and
+    /// `TRUNCATE` must use `ONLY` so child rows are not duplicated or wiped.
+    pub has_inheritance_children: bool,
     pub sequences: Vec<SequenceState>,
 }
 
@@ -166,6 +169,16 @@ impl TableSnapshot {
     /// `schema.table`, quoted.
     pub fn qualified(&self) -> String {
         format!("{}.{}", quote_ident(&self.schema), quote_ident(&self.name))
+    }
+
+    /// `ONLY schema.table` when the table is a classic inheritance parent,
+    /// otherwise `schema.table`.
+    pub fn qualified_only(&self) -> String {
+        if self.has_inheritance_children {
+            format!("ONLY {}", self.qualified())
+        } else {
+            self.qualified()
+        }
     }
 
     pub fn shadow(&self) -> String {
@@ -203,21 +216,47 @@ pub struct Snapshot {
     tables: BTreeMap<i64, TableSnapshot>,
     /// `parent -> children` foreign-key edges (OIDs).
     referenced_by: BTreeMap<i64, BTreeSet<i64>>,
+    /// Snapshotted tables referenced via foreign key by a table outside the
+    /// snapshot (excluded / migration tables), which therefore cannot be
+    /// truncated without `CASCADE` and must be cleared with `DELETE`.
+    referenced_by_excluded: BTreeSet<i64>,
+    /// `(schema, partition_name) -> root partitioned table OID`.
+    partition_roots: BTreeMap<(String, String), i64>,
+    /// User-schema sequences not attached to any snapshotted table.
+    standalone_sequences: Vec<SequenceState>,
+    /// Active schema resolution order from `current_schemas(false)`.
+    search_path: Vec<String>,
+    /// Whether this role may set `session_replication_role = replica`.
+    can_replica_role: bool,
 }
 
 impl Snapshot {
     /// Builds a snapshot description without touching the database (tests).
     pub fn from_parts(tables: Vec<TableSnapshot>, foreign_keys: &[(i64, i64)]) -> Self {
-        let mut s = Snapshot::default();
+        let mut s = Snapshot {
+            search_path: vec!["public".into()],
+            ..Snapshot::default()
+        };
         for t in tables {
             s.tables.insert(t.oid, t);
         }
         for &(child, parent) in foreign_keys {
-            if child != parent && s.tables.contains_key(&child) && s.tables.contains_key(&parent) {
-                s.referenced_by.entry(parent).or_default().insert(child);
+            if child != parent && s.tables.contains_key(&parent) {
+                if s.tables.contains_key(&child) {
+                    s.referenced_by.entry(parent).or_default().insert(child);
+                } else {
+                    s.referenced_by_excluded.insert(parent);
+                }
             }
         }
         s
+    }
+
+    /// Overrides the `search_path` used when resolving unqualified names (tests).
+    #[must_use]
+    pub fn with_search_path(mut self, schemas: Vec<String>) -> Self {
+        self.search_path = schemas;
+        self
     }
 
     pub fn tables(&self) -> impl Iterator<Item = &TableSnapshot> {
@@ -235,11 +274,37 @@ impl Snapshot {
     /// Captures every user table into `_pgloom_snap`.
     pub async fn capture(ctl: &PgControl, options: &SnapshotOptions) -> PgCtrlResult<Self> {
         let client = ctl.client();
+        let can_replica_role = ctl
+            .batch(
+                "BEGIN; SET LOCAL session_replication_role = replica; ROLLBACK;",
+                "probing session_replication_role",
+            )
+            .await
+            .is_ok();
+        if !can_replica_role {
+            let _ = ctl.batch("ROLLBACK", "cleaning up failed probe").await;
+        }
+
+        let sp_rows = client
+            .query("SELECT unnest(current_schemas(false))::text", &[])
+            .await
+            .map_err(PgCtrlError::query("reading search_path"))?;
+        let mut search_path: Vec<String> = sp_rows
+            .iter()
+            .map(|r| r.col(0, "reading search_path"))
+            .collect::<PgCtrlResult<_>>()?;
+        if search_path.is_empty() {
+            search_path.push("public".into());
+        }
+
         let rows = client
             .query(
                 "SELECT c.oid::int8, n.nspname::text, c.relname::text, \
                         EXISTS (SELECT 1 FROM pg_trigger t \
-                                WHERE t.tgrelid = c.oid AND NOT t.tgisinternal) \
+                                WHERE t.tgrelid = c.oid AND NOT t.tgisinternal), \
+                        c.relkind = 'r' AND EXISTS ( \
+                            SELECT 1 FROM pg_inherits i WHERE i.inhparent = c.oid \
+                        ) \
                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition \
                    AND n.nspname NOT IN ('pg_catalog', 'information_schema', '_pgloom_snap') \
@@ -275,11 +340,48 @@ impl Snapshot {
                     name,
                     columns: Vec::new(),
                     has_user_triggers: row.col(3, CONTEXT)?,
+                    has_inheritance_children: row.col(4, CONTEXT)?,
                     sequences: Vec::new(),
                 },
             );
         }
         let oids: Vec<i64> = tables.keys().copied().collect();
+
+        let part_rows = client
+            .query(
+                "WITH RECURSIVE tree(leaf, root) AS ( \
+                   SELECT c.oid, i.inhparent \
+                   FROM pg_class c \
+                   JOIN pg_inherits i ON i.inhrelid = c.oid \
+                   WHERE c.relispartition \
+                   UNION ALL \
+                   SELECT t.leaf, i.inhparent \
+                   FROM tree t \
+                   JOIN pg_inherits i ON i.inhrelid = t.root \
+                 ) \
+                 SELECT n.nspname::text, c.relname::text, t.root::int8 \
+                 FROM tree t \
+                 JOIN pg_class c ON c.oid = t.leaf \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 JOIN pg_class r ON r.oid = t.root \
+                 WHERE NOT r.relispartition \
+                   AND n.nspname NOT IN ('pg_catalog', 'information_schema', '_pgloom_snap') \
+                   AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%' \
+                 ORDER BY t.leaf",
+                &[],
+            )
+            .await
+            .map_err(PgCtrlError::query("listing table partitions"))?;
+        let mut partition_roots: BTreeMap<(String, String), i64> = BTreeMap::new();
+        for row in part_rows {
+            const CONTEXT: &str = "listing table partitions";
+            let schema: String = row.col(0, CONTEXT)?;
+            let name: String = row.col(1, CONTEXT)?;
+            let root: i64 = row.col(2, CONTEXT)?;
+            if tables.contains_key(&root) {
+                partition_roots.insert((schema, name), root);
+            }
+        }
 
         let cols = client
             .query(
@@ -298,36 +400,74 @@ impl Snapshot {
             }
         }
 
-        let seqs = client
+        // Capture all user sequences: owned (SERIAL/IDENTITY), referenced by
+        // column defaults (pg_attrdef), and standalone sequences.
+        let all_seq_rows = client
             .query(
-                "SELECT d.refobjid::int8, \
+                "SELECT s.oid::int8, \
                         quote_ident(n.nspname) || '.' || quote_ident(s.relname) \
                  FROM pg_class s \
                  JOIN pg_namespace n ON n.oid = s.relnamespace \
-                 JOIN pg_depend d ON d.objid = s.oid \
-                   AND d.classid = 'pg_class'::regclass AND d.refclassid = 'pg_class'::regclass \
-                 WHERE s.relkind = 'S' AND d.deptype IN ('a', 'i') \
-                   AND d.refobjid = ANY($1::int8[]::oid[]) \
+                 WHERE s.relkind = 'S' \
+                   AND n.nspname NOT IN ('pg_catalog', 'information_schema', '_pgloom_snap') \
+                   AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%' \
                  ORDER BY s.oid",
-                &[&oids],
+                &[],
             )
             .await
-            .map_err(PgCtrlError::query("listing owned sequences"))?;
-        for row in seqs {
-            let oid: i64 = row.col(0, "listing owned sequences")?;
-            let name: String = row.col(1, "listing owned sequences")?;
+            .map_err(PgCtrlError::query("listing user sequences"))?;
+        let mut seq_states: BTreeMap<i64, SequenceState> = BTreeMap::new();
+        for row in all_seq_rows {
+            let seq_oid: i64 = row.col(0, "listing user sequences")?;
+            let name: String = row.col(1, "listing user sequences")?;
             let state = client
                 .query_one(&format!("SELECT last_value, is_called FROM {name}"), &[])
                 .await
                 .map_err(PgCtrlError::query(format!("reading sequence {name}")))?;
-            if let Some(t) = tables.get_mut(&oid) {
-                t.sequences.push(SequenceState {
+            seq_states.insert(
+                seq_oid,
+                SequenceState {
                     name,
                     last_value: state.col(0, "reading sequence state")?,
                     is_called: state.col(1, "reading sequence state")?,
-                });
+                },
+            );
+        }
+
+        let seq_links = client
+            .query(
+                "SELECT d.refobjid::int8, d.objid::int8 \
+                 FROM pg_depend d \
+                 JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' \
+                 WHERE d.classid = 'pg_class'::regclass \
+                   AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i') \
+                   AND d.refobjid = ANY($1::int8[]::oid[]) \
+                 UNION \
+                 SELECT ad.adrelid::int8, d.refobjid::int8 \
+                 FROM pg_attrdef ad \
+                 JOIN pg_depend d ON d.classid = 'pg_attrdef'::regclass AND d.objid = ad.oid \
+                   AND d.refclassid = 'pg_class'::regclass \
+                 JOIN pg_class s ON s.oid = d.refobjid AND s.relkind = 'S' \
+                 WHERE ad.adrelid = ANY($1::int8[]::oid[]) \
+                 ORDER BY 1, 2",
+                &[&oids],
+            )
+            .await
+            .map_err(PgCtrlError::query("listing table sequences"))?;
+        let mut attached_seqs: BTreeSet<i64> = BTreeSet::new();
+        for row in seq_links {
+            let table_oid: i64 = row.col(0, "listing table sequences")?;
+            let seq_oid: i64 = row.col(1, "listing table sequences")?;
+            if let (Some(t), Some(state)) = (tables.get_mut(&table_oid), seq_states.get(&seq_oid)) {
+                t.sequences.push(state.clone());
+                attached_seqs.insert(seq_oid);
             }
         }
+        let standalone_sequences: Vec<SequenceState> = seq_states
+            .into_iter()
+            .filter(|(oid, _)| !attached_seqs.contains(oid))
+            .map(|(_, s)| s)
+            .collect();
 
         let fks = client
             .query(
@@ -347,10 +487,19 @@ impl Snapshot {
             })
             .collect::<PgCtrlResult<_>>()?;
 
-        let snapshot = Snapshot::from_parts(tables.into_values().collect(), &fk_pairs);
+        let mut snapshot = Snapshot::from_parts(tables.into_values().collect(), &fk_pairs);
+        snapshot.partition_roots = partition_roots;
+        snapshot.standalone_sequences = standalone_sequences;
+        snapshot.search_path = search_path;
+        snapshot.can_replica_role = can_replica_role;
         ctl.batch(&snapshot.capture_sql(), "creating snapshot tables")
             .await?;
-        debug!(tables = snapshot.len(), "snapshot captured");
+        debug!(
+            tables = snapshot.len(),
+            can_replica_role,
+            standalone_sequences = snapshot.standalone_sequences.len(),
+            "snapshot captured"
+        );
         Ok(snapshot)
     }
 
@@ -364,37 +513,50 @@ impl Snapshot {
                 "CREATE UNLOGGED TABLE {} AS SELECT {} FROM {};\n",
                 t.shadow(),
                 t.column_list(),
-                t.qualified()
+                t.qualified_only()
             ));
         }
         sql
     }
 
-    /// Maps a table reference as written in SQL to snapshotted tables.
-    ///
-    /// Unqualified names are resolved like a default `search_path`: a match in
-    /// `public` wins; otherwise every schema with that table name matches.
+    /// Maps a table (or child partition) reference as written in SQL to
+    /// snapshotted root tables, honouring the captured `search_path`.
     pub fn resolve(&self, reference: &str) -> Vec<i64> {
         let (schema, name) = match reference.rsplit_once('.') {
             Some((s, n)) => (Some(s), n),
             None => (None, reference),
         };
-        let matches: Vec<&TableSnapshot> = self
+        let mut matches: Vec<(&str, i64)> = self
             .tables
             .values()
             .filter(|t| t.name == name && schema.is_none_or(|s| s == t.schema))
+            .map(|t| (t.schema.as_str(), t.oid))
             .collect();
-        if schema.is_none()
-            && let Some(public) = matches.iter().find(|t| t.schema == "public")
-        {
-            return vec![public.oid];
+        for ((p_schema, p_name), &root_oid) in &self.partition_roots {
+            if p_name == name && schema.is_none_or(|s| s == p_schema) {
+                matches.push((p_schema.as_str(), root_oid));
+            }
         }
-        matches.iter().map(|t| t.oid).collect()
+        if schema.is_none() {
+            for sp in &self.search_path {
+                let in_schema: BTreeSet<i64> = matches
+                    .iter()
+                    .filter(|(s, _)| *s == sp.as_str())
+                    .map(|(_, oid)| *oid)
+                    .collect();
+                if !in_schema.is_empty() {
+                    return in_schema.into_iter().collect();
+                }
+            }
+        }
+        let deduped: BTreeSet<i64> = matches.into_iter().map(|(_, oid)| oid).collect();
+        deduped.into_iter().collect()
     }
 
     /// Tables to restore for `dirty` references, closed over foreign keys and
-    /// widened to every table if a write was opaque or touched a table with
-    /// user triggers. Returned parent-first.
+    /// widened to every table if a write was opaque, targeted an unresolved
+    /// non-temporary relation (e.g. an updatable view), or touched a table
+    /// with user triggers. Returned parent-first.
     pub fn restore_plan(
         &self,
         dirty: &BTreeSet<String>,
@@ -409,10 +571,14 @@ impl Snapshot {
             }
             set.extend(oids);
         }
+        let non_temp_unresolved = unresolved.iter().any(|r| {
+            let lower = r.to_ascii_lowercase();
+            !lower.starts_with("pg_temp.") && !lower.starts_with("pg_temp_")
+        });
         let triggers = set
             .iter()
             .any(|oid| self.tables.get(oid).is_some_and(|t| t.has_user_triggers));
-        if opaque_writes || triggers {
+        if opaque_writes || triggers || non_temp_unresolved {
             set = self.tables.keys().copied().collect();
         }
         // Children referencing a restored table must be restored as well:
@@ -427,11 +593,13 @@ impl Snapshot {
                 }
             }
         }
-        (self.parent_first(&set), unresolved)
+        let (order, _) = self.parent_first(&set);
+        (order, unresolved)
     }
 
     /// Kahn's algorithm over the restore set; ties broken by OID.
-    fn parent_first(&self, set: &BTreeSet<i64>) -> Vec<i64> {
+    /// Returns `(order, has_cycle)`.
+    fn parent_first(&self, set: &BTreeSet<i64>) -> (Vec<i64>, bool) {
         let mut indegree: BTreeMap<i64, usize> = set.iter().map(|&o| (o, 0)).collect();
         for (parent, children) in &self.referenced_by {
             if !set.contains(parent) {
@@ -463,30 +631,74 @@ impl Snapshot {
                 }
             }
         }
-        // Foreign-key cycles: append the rest in OID order; PostgreSQL checks
-        // non-deferred constraints per statement, so self-contained cycles
-        // still restore when each table's rows are self-consistent.
+        // Foreign-key cycles cannot be topologically ordered: append the
+        // remaining tables in OID order and signal `restore_sql` to suppress
+        // or defer constraint checks for the restore transaction.
+        let has_cycle = !indegree.is_empty();
         order.extend(indegree.keys().copied());
-        order
+        (order, has_cycle)
+    }
+
+    fn plan_has_cycle(&self, plan: &[i64]) -> bool {
+        let set: BTreeSet<i64> = plan.iter().copied().collect();
+        self.parent_first(&set).1
     }
 
     /// The single-transaction restore script for `plan` (parent-first OIDs).
     pub fn restore_sql(&self, plan: &[i64]) -> String {
+        self.restore_sql_with(plan, self.plan_has_cycle(plan), false)
+    }
+
+    fn restore_sql_with(
+        &self,
+        plan: &[i64],
+        has_cycle: bool,
+        include_standalone_sequences: bool,
+    ) -> String {
         let tables: Vec<&TableSnapshot> = plan.iter().filter_map(|o| self.tables.get(o)).collect();
-        if tables.is_empty() {
+        let has_standalone = include_standalone_sequences && !self.standalone_sequences.is_empty();
+        if tables.is_empty() && !has_standalone {
             return String::new();
         }
         // The restore need not survive a crash (the snapshot does), so its
         // commit skips the WAL flush.
         let mut sql = String::from("BEGIN;\nSET LOCAL synchronous_commit = off;\n");
-        sql.push_str(&format!(
-            "TRUNCATE TABLE {};\n",
-            tables
-                .iter()
-                .map(|t| t.qualified())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        let has_triggers = tables.iter().any(|t| t.has_user_triggers);
+        let use_replica_role = self.can_replica_role && (has_triggers || has_cycle);
+        if use_replica_role {
+            sql.push_str("SET LOCAL session_replication_role = replica;\n");
+        } else {
+            if has_cycle {
+                sql.push_str("SET CONSTRAINTS ALL DEFERRED;\n");
+            }
+            for t in &tables {
+                if t.has_user_triggers {
+                    sql.push_str(&format!(
+                        "ALTER TABLE {} DISABLE TRIGGER USER;\n",
+                        t.qualified()
+                    ));
+                }
+            }
+        }
+
+        let (deletable, truncatable): (Vec<&TableSnapshot>, Vec<&TableSnapshot>) = tables
+            .iter()
+            .copied()
+            .partition(|t| self.referenced_by_excluded.contains(&t.oid));
+        for t in deletable.iter().rev() {
+            sql.push_str(&format!("DELETE FROM {};\n", t.qualified_only()));
+        }
+        if !truncatable.is_empty() {
+            sql.push_str(&format!(
+                "TRUNCATE TABLE {};\n",
+                truncatable
+                    .iter()
+                    .map(|t| t.qualified_only())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
         for t in &tables {
             if t.columns.is_empty() {
                 continue;
@@ -498,14 +710,39 @@ impl Snapshot {
                 t.shadow()
             ));
         }
+        if !use_replica_role {
+            for t in &tables {
+                if t.has_user_triggers {
+                    sql.push_str(&format!(
+                        "ALTER TABLE {} ENABLE TRIGGER USER;\n",
+                        t.qualified()
+                    ));
+                }
+            }
+        }
+        let mut seen_seqs: BTreeSet<&str> = BTreeSet::new();
         for t in &tables {
             for s in &t.sequences {
-                sql.push_str(&format!(
-                    "SELECT setval({}, {}, {});\n",
-                    quote_literal(&s.name),
-                    s.last_value,
-                    s.is_called
-                ));
+                if seen_seqs.insert(s.name.as_str()) {
+                    sql.push_str(&format!(
+                        "SELECT setval({}, {}, {});\n",
+                        quote_literal(&s.name),
+                        s.last_value,
+                        s.is_called
+                    ));
+                }
+            }
+        }
+        if include_standalone_sequences {
+            for s in &self.standalone_sequences {
+                if seen_seqs.insert(s.name.as_str()) {
+                    sql.push_str(&format!(
+                        "SELECT setval({}, {}, {});\n",
+                        quote_literal(&s.name),
+                        s.last_value,
+                        s.is_called
+                    ));
+                }
             }
         }
         sql.push_str("COMMIT;\n");
@@ -520,7 +757,9 @@ impl Snapshot {
         opaque_writes: bool,
     ) -> PgCtrlResult<RestoreStats> {
         let (plan, unresolved) = self.restore_plan(dirty, opaque_writes);
-        let sql = self.restore_sql(&plan);
+        let has_cycle = self.plan_has_cycle(&plan);
+        let reset_standalone = opaque_writes || !unresolved.is_empty();
+        let sql = self.restore_sql_with(&plan, has_cycle, reset_standalone);
         if !sql.is_empty()
             && let Err(err) = ctl.batch(&sql, "restoring snapshot").await
         {
@@ -562,6 +801,7 @@ mod tests {
             name: name.into(),
             columns: cols.iter().map(|c| c.to_string()).collect(),
             has_user_triggers: false,
+            has_inheritance_children: false,
             sequences: Vec::new(),
         }
     }
@@ -635,10 +875,17 @@ mod tests {
         assert_eq!(plan, vec![10, 20, 30]);
         assert!(unresolved.is_empty());
 
-        let dirty: BTreeSet<String> = ["entries".to_string(), "temp_x".to_string()].into();
+        let dirty: BTreeSet<String> = ["entries".to_string(), "pg_temp.temp_x".to_string()].into();
         let (plan, unresolved) = s.restore_plan(&dirty, false);
         assert_eq!(plan, vec![30]);
-        assert_eq!(unresolved, vec!["temp_x"]);
+        assert_eq!(unresolved, vec!["pg_temp.temp_x"]);
+
+        // An unresolved non-temporary target (e.g. an updatable view) fails
+        // closed by restoring every snapshotted table.
+        let dirty: BTreeSet<String> = ["active_wallets".to_string()].into();
+        let (plan, unresolved) = s.restore_plan(&dirty, false);
+        assert_eq!(plan, vec![10, 20, 30, 40]);
+        assert_eq!(unresolved, vec!["active_wallets"]);
     }
 
     #[test]
